@@ -182,7 +182,8 @@ def _load_viv_workspace(sample_path: Path, file_type: FileType, analysis_meta: L
             if vw.getMeta(FLOSS_ANALYSIS_META) == analysis_meta:
                 return vw
             logger.info(
-                "ignoring existing workspace %s: not analyzed with this format, vivisect version, and signatures",
+                "ignoring existing workspace %s: not analyzed from this sample content, format, vivisect version, "
+                "and signatures",
                 viv_file,
             )
         else:
@@ -199,8 +200,17 @@ def _load_viv_workspace(sample_path: Path, file_type: FileType, analysis_meta: L
     return vw
 
 
-def _get_analysis_meta(fmt: str, sigpaths: List[Path]) -> List[str]:
-    return [fmt, viv_utils.getVivisectLibraryVersion()] + [hashlib.sha256(p.read_bytes()).hexdigest() for p in sigpaths]
+def _get_analysis_meta(sample_path: Path, fmt: str, sigpaths: List[Path]) -> List[str]:
+    # This is the trust generation for a vivisect workspace: a cached workspace
+    # may only be deserialized/reused when it was produced from the same sample
+    # contents with the same format and signature set. Without binding the
+    # sample digest, a same-named but different sample would happily reuse the
+    # stale workspace next to it.
+    return [
+        hashlib.sha256(sample_path.read_bytes()).hexdigest(),
+        fmt,
+        viv_utils.getVivisectLibraryVersion(),
+    ] + [hashlib.sha256(p.read_bytes()).hexdigest() for p in sigpaths]
 
 
 def load_vw(
@@ -225,7 +235,7 @@ def load_vw(
     sigpaths = sigpaths if file_type is FileType.PE else []
     if format not in ("sc32", "sc64"):
         format = "pe" if file_type is FileType.PE else "elf"
-    analysis_meta = _get_analysis_meta(format, sigpaths)
+    analysis_meta = _get_analysis_meta(sample_path, format, sigpaths)
 
     if format == "sc32":
         vw = viv_utils.getShellcodeWorkspaceFromFile(str(sample_path), arch="i386", analyze=False)

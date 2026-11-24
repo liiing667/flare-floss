@@ -104,6 +104,20 @@ def test_cached_workspace_skips_analysis(tmp_path, monkeypatch):
     assert set(vw.getFunctions()) == expected
 
 
+def test_cached_workspace_is_bound_to_sample_content(tmp_path, monkeypatch):
+    path = _copy_sample(tmp_path)
+    load_vw(path, "auto", [], should_save_workspace=True)
+
+    # same name, different contents: the cached workspace must not be reused
+    path.write_bytes(path.read_bytes() + b"\x00")
+    monkeypatch.setenv(FLOSS_LOAD_VIV_WORKSPACE_ENV, "1")
+    calls = _spy_analyze(monkeypatch)
+
+    vw = load_vw(path, "auto", [], should_save_workspace=True)
+    assert len(calls) == 1
+    assert vw.getMeta("Format") == "pe"
+
+
 @pytest.mark.parametrize("cached_format, other_sigs", [("auto", True), ("sc32", False)])
 def test_cached_workspace_from_other_analysis_is_reanalyzed(tmp_path, monkeypatch, cached_format, other_sigs):
     path = _copy_sample(tmp_path)
