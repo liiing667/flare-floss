@@ -248,3 +248,79 @@ def test_filter_functions_accepts_stack_only_function():
 
     with pytest.raises(InvalidLoadConfig):
         filter_functions(doc, [0x999999])
+
+
+def test_filter_functions_counts_functions_and_preserves_decoding_source():
+    """filtering by function counts distinct functions, not recovered strings."""
+    from floss.results import (
+        Strings,
+        Analysis,
+        Metadata,
+        AddressType,
+        StackString,
+        TightString,
+        DecodedString,
+        ResultDocument,
+        StringEncoding,
+        filter_functions,
+        get_string_function,
+    )
+
+    fva = 0x401000
+
+    def stack_string(value: str, offset: int) -> StackString:
+        return StackString(
+            function=fva,
+            string=value,
+            encoding=StringEncoding.ASCII,
+            program_counter=offset,
+            stack_pointer=0x4000,
+            original_stack_pointer=0x39A0,
+            offset=offset,
+            frame_offset=0x10,
+        )
+
+    decoded = [
+        DecodedString(
+            address=0x3000,
+            address_type=AddressType.STACK,
+            string=value,
+            encoding=StringEncoding.ASCII,
+            decoded_at=offset,
+            decoding_routine=fva,
+        )
+        for value, offset in (("hello", 0x100), ("world", 0x200))
+    ]
+    doc = ResultDocument(
+        metadata=Metadata(file_path="x", min_length=4),
+        analysis=Analysis(enable_stack_strings=True, enable_tight_strings=True, enable_decoded_strings=True),
+        strings=Strings(
+            stack_strings=[stack_string("one", 0x10), stack_string("two", 0x20)],
+            tight_strings=[
+                TightString(
+                    function=fva,
+                    string="three",
+                    encoding=StringEncoding.ASCII,
+                    program_counter=0x30,
+                    stack_pointer=0x4000,
+                    original_stack_pointer=0x39A0,
+                    offset=0x30,
+                    frame_offset=0x10,
+                )
+            ],
+            decoded_strings=decoded,
+        ),
+    )
+    doc.analysis.functions.decoding_function_scores = {fva: {"score": 0.9, "xrefs_to": 2}}
+
+    filter_functions(doc, [fva])
+
+    functions = doc.analysis.functions
+    assert functions.analyzed_stack_strings == 1
+    assert functions.analyzed_tight_strings == 1
+    assert functions.analyzed_decoded_strings == 1
+    assert set(functions.decoding_function_scores) == {fva}
+    assert len(doc.strings.stack_strings) == 2
+    assert len(doc.strings.tight_strings) == 1
+    assert len(doc.strings.decoded_strings) == 2
+    assert {get_string_function(s) for s in doc.strings.decoded_strings} == {fva}

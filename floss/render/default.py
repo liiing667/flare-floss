@@ -38,6 +38,7 @@ from floss.results import (
     DecodedString,
     ResultDocument,
     StringEncoding,
+    get_string_function,
 )
 from floss.tags.filter import TagRules, hide_strings_by_rules
 from floss.render.filter import LayoutFilter
@@ -308,7 +309,7 @@ def render_decoded_strings(decoded_strings: List[DecodedString], console, verbos
     else:
         strings_by_functions: Dict[int, list] = collections.defaultdict(list)
         for ds in decoded_strings:
-            strings_by_functions[ds.decoding_routine].append(ds)
+            strings_by_functions[get_string_function(ds)].append(ds)
 
         for fva, data in strings_by_functions.items():
             render_sub_heading(" FUNCTION at " + heading_style(f"0x{fva:x}"), len(data), console, disable_headers)

@@ -19,7 +19,7 @@ import time
 import datetime
 import contextlib
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Iterator, Optional
+from typing import TYPE_CHECKING, Dict, List, Union, Iterator, Optional
 from pathlib import Path
 from dataclasses import field, dataclass
 
@@ -126,6 +126,22 @@ class DecodedString:
     encoding: StringEncoding
     decoded_at: int
     decoding_routine: int
+
+    @property
+    def function(self) -> int:
+        """Address of the function that decoded this string.
+
+        ``decoding_routine`` is the serialized field name, but every recovered
+        string type exposes the same ``function`` identity so selection,
+        counts, evidence, and rendering all agree on which function a string
+        belongs to.
+        """
+        return self.decoding_routine
+
+
+def get_string_function(s: Union[StackString, TightString, DecodedString]) -> int:
+    """Return the function address associated with a recovered string."""
+    return s.function
 
 
 @dataclass(frozen=True)
@@ -393,11 +409,12 @@ def filter_functions(results: ResultDocument, functions: List[int]) -> None:
     # a function is valid if it appears in any string category; decoding
     # functions additionally have a score. don't require a decoding score for
     # stack/tight-only functions.
-    stack_fvas = {f.function for f in results.strings.stack_strings}
-    tight_fvas = {f.function for f in results.strings.tight_strings}
-    decoded_fvas = {f.decoding_routine for f in results.strings.decoded_strings}
+    stack_fvas = {get_string_function(s) for s in results.strings.stack_strings}
+    tight_fvas = {get_string_function(s) for s in results.strings.tight_strings}
+    decoded_fvas = {get_string_function(s) for s in results.strings.decoded_strings}
     known_fvas = stack_fvas | tight_fvas | decoded_fvas | set(results.analysis.functions.decoding_function_scores)
 
+    requested_fvas = set(functions)
     for fva in functions:
         if fva not in known_fvas:
             raise InvalidLoadConfig(f"function 0x{fva:x} not found in loaded data")
@@ -409,13 +426,30 @@ def filter_functions(results: ResultDocument, functions: List[int]) -> None:
     }
     results.analysis.functions.decoding_function_scores = filtered_scores
 
-    results.strings.stack_strings = [f for f in results.strings.stack_strings if f.function in functions]
-    results.strings.tight_strings = [f for f in results.strings.tight_strings if f.function in functions]
-    results.strings.decoded_strings = [f for f in results.strings.decoded_strings if f.decoding_routine in functions]
+    results.strings.stack_strings = [
+        s for s in results.strings.stack_strings if get_string_function(s) in requested_fvas
+    ]
+    results.strings.tight_strings = [
+        s for s in results.strings.tight_strings if get_string_function(s) in requested_fvas
+    ]
+    results.strings.decoded_strings = [
+        s for s in results.strings.decoded_strings if get_string_function(s) in requested_fvas
+    ]
 
-    results.analysis.functions.analyzed_stack_strings = len(results.strings.stack_strings)
-    results.analysis.functions.analyzed_tight_strings = len(results.strings.tight_strings)
-    results.analysis.functions.analyzed_decoded_strings = len(results.strings.decoded_strings)
+    # these counts describe distinct functions analyzed for each category, not
+    # the number of strings recovered from them. a function can yield any
+    # number of strings (or, for decoding, only appear as a scored candidate)
+    # and must still count once.
+    results.analysis.functions.analyzed_stack_strings = len(
+        {get_string_function(s) for s in results.strings.stack_strings} & requested_fvas
+    )
+    results.analysis.functions.analyzed_tight_strings = len(
+        {get_string_function(s) for s in results.strings.tight_strings} & requested_fvas
+    )
+    decoded_function_fvas = set(results.analysis.functions.decoding_function_scores) | {
+        get_string_function(s) for s in results.strings.decoded_strings
+    }
+    results.analysis.functions.analyzed_decoded_strings = len(decoded_function_fvas & requested_fvas)
 
 
 def filter_string_len(results: ResultDocument, min_length: int) -> None:
