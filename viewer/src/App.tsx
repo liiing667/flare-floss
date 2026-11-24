@@ -8,6 +8,45 @@ import flossLogo from './floss-logo.png';
 
 const NOISY_TAGS = ['#common', '#duplicate', '#code', '#reloc', '#code-junk'];
 
+// Strings extracted from malware are attacker-controlled. Keep the raw value in
+// the document, but display the same readable escaping used by the Python text
+// renderer (floss/render/sanitize.py): control characters cannot drive the
+// browser/terminal, backslashes stay unambiguous, and ordinary Unicode and
+// quotes remain verbatim.
+const NAMED_ESCAPES: Record<string, string> = {
+  '\\': '\\\\',
+  '\n': '\\n',
+  '\r': '\\r',
+  '\t': '\\t',
+  '\b': '\\b',
+  '\f': '\\f',
+};
+const NON_PRINTABLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u;
+
+const escapeForDisplay = (value: string): string => {
+  let rendered = '';
+  for (const ch of value) {
+    const named = NAMED_ESCAPES[ch];
+    if (named !== undefined) {
+      rendered += named;
+      continue;
+    }
+    // ASCII space is printable in Python's str.isprintable(); other Unicode
+    // space separators are not.
+    if (ch === ' ' || !NON_PRINTABLE.test(ch)) {
+      rendered += ch;
+      continue;
+    }
+    const codepoint = ch.codePointAt(0) ?? 0;
+    if (codepoint <= 0xffff) {
+      rendered += `\\u${codepoint.toString(16).padStart(4, '0')}`;
+    } else {
+      rendered += `\\U${codepoint.toString(16).padStart(8, '0')}`;
+    }
+  }
+  return rendered;
+};
+
 interface DisplayOptions {
   showTags: boolean;
   showEncoding: boolean;
@@ -58,9 +97,9 @@ const StringItem: React.FC<{
     <div
       className={`string-view ${alt ? 'string-view--alt' : ''}`}
       style={style}
-      title={str.string}
+      title={escapeForDisplay(str.string)}
     >
-      <span className={`string-content ${styleClass}`}>{str.string}</span>
+      <span className={`string-content ${styleClass}`}>{escapeForDisplay(str.string)}</span>
       {displayOptions.showTags && <span className={`string-tags ${styleClass}`}>{str.tags.join(' ')}</span>}
       {displayOptions.showEncoding && <span className="string-encoding">{str.encoding === 'unicode' ? 'U' : ''}</span>}
       {displayOptions.showOffsetAndStructure && (
@@ -168,8 +207,8 @@ const VirtualList: React.FC<{ layout: ResultLayout; displayOptions: DisplayOptio
 
 const StackStringRow: React.FC<{ str: StackString; showEncoding: boolean; alt?: boolean; style?: React.CSSProperties }> = React.memo(
   ({ str, showEncoding, alt, style }) => (
-    <div className={`string-view obfuscated-row${alt ? ' string-view--alt' : ''}`} style={style} title={str.string}>
-      <span className="string-content">{str.string}</span>
+    <div className={`string-view obfuscated-row${alt ? ' string-view--alt' : ''}`} style={style} title={escapeForDisplay(str.string)}>
+      <span className="string-content">{escapeForDisplay(str.string)}</span>
       {showEncoding && <span className="string-encoding">{encodingMark(str.encoding)}</span>}
       <span className="obf-meta">{formatHex(str.function)}</span>
       <span className="obf-meta">{formatHex(str.program_counter)}</span>
@@ -180,8 +219,8 @@ const StackStringRow: React.FC<{ str: StackString; showEncoding: boolean; alt?: 
 
 const DecodedStringRow: React.FC<{ str: DecodedString; showEncoding: boolean; alt?: boolean; style?: React.CSSProperties }> = React.memo(
   ({ str, showEncoding, alt, style }) => (
-    <div className={`string-view obfuscated-row${alt ? ' string-view--alt' : ''}`} style={style} title={str.string}>
-      <span className="string-content">{str.string}</span>
+    <div className={`string-view obfuscated-row${alt ? ' string-view--alt' : ''}`} style={style} title={escapeForDisplay(str.string)}>
+      <span className="string-content">{escapeForDisplay(str.string)}</span>
       {showEncoding && <span className="string-encoding">{encodingMark(str.encoding)}</span>}
       <span className="obf-meta">{formatDecodedAddress(str)}</span>
       <span className="obf-meta">{formatHex(str.decoded_at)}</span>

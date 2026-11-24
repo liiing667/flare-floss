@@ -220,9 +220,9 @@ def render_language_strings(language, language_strings, language_strings_missed,
     offset_len = len(f"{strings[-1].offset}")
     for s in strings:
         if verbose == Verbosity.DEFAULT:
-            console.print(sanitize(s.string, is_ascii_only=False), markup=False)
+            console.print(sanitize(s.string), markup=False)
         else:
-            colored_string = string_style(sanitize(s.string, is_ascii_only=False))
+            colored_string = string_style(sanitize(s.string))
             console.print(f"0x{s.offset:>0{offset_len}x} {colored_string}")
 
 

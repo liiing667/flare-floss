@@ -21,7 +21,6 @@ tree headers/footers.
 
 from __future__ import annotations
 
-import json
 from typing import Optional, Sequence
 
 from rich.text import Text
@@ -30,6 +29,7 @@ from rich.console import Group, Console
 
 from floss.results import ResultLayout, ResultString
 from floss.tags.filter import TagRules
+from floss.render.sanitize import sanitize
 
 # columns available in the layout view; controlled by --columns
 COLUMN_CHOICES = ("tags", "offset", "structure", "encoding")
@@ -80,11 +80,9 @@ def render_string_string(s: ResultString, tag_rules: TagRules) -> Text:
     if string_style is None:
         raise ValueError("string should be hidden")
 
-    # render like json, but strip the leading/trailing quote marks.
-    # this means that whitespace characters like \t, \n, and \r are rendered as
-    # literal escape sequences, which keeps the rendered string on a single line
-    # and matches the escaping done by sanitize() in the classic views.
-    rendered_string = json.dumps(s.string)[1:-1]
+    # use the same readable escaping as the classic text views, so control
+    # characters and non-ASCII text are identified consistently across reports.
+    rendered_string = sanitize(s.string)
     return make_span(rendered_string, style=string_style)
 
 

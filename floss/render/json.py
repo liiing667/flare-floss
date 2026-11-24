@@ -59,6 +59,31 @@ def sort_nested(obj):
 TOP_LEVEL_KEYS = ("metadata", "analysis", "strings", "layout")
 
 
+def _escape_nonprintable_json(text: str) -> str:
+    """escape non-ASCII control/invisible characters that JSON permits verbatim.
+
+    ``json.dumps`` always escapes ASCII control characters, but it leaves C1
+    controls (for example U+009B, the ANSI CSI introducer), DEL, bidi overrides,
+    and Unicode line separators untouched when ``ensure_ascii=False``.  Those
+    characters can drive a terminal or otherwise hide the evidence, so escape
+    them while keeping ordinary printable Unicode human-readable.
+    """
+    rendered: list[str] = []
+    for c in text:
+        if c.isprintable():
+            rendered.append(c)
+            continue
+
+        codepoint = ord(c)
+        if codepoint <= 0xFFFF:
+            rendered.append("\\u%04x" % codepoint)
+        else:
+            # JSON has no \U escape; use a surrogate pair
+            codepoint -= 0x10000
+            rendered.append("\\u%04x\\u%04x" % (0xD800 + (codepoint >> 10), 0xDC00 + (codepoint & 0x3FF)))
+    return "".join(rendered)
+
+
 def _render_dict(data: dict) -> str:
     """serialize a results-document dict with fixed top-level ordering."""
     # keep the fixed top-level ordering (metadata first so the document stays
@@ -67,7 +92,11 @@ def _render_dict(data: dict) -> str:
     extra_keys = [key for key in data if key not in TOP_LEVEL_KEYS]
     ordered_keys = list(TOP_LEVEL_KEYS) + extra_keys
     top = {key: sort_nested(data[key]) for key in ordered_keys if key in data}
-    return json.dumps(top, cls=FlossJSONEncoder, sort_keys=False)
+    # keep ordinary Unicode verbatim so the JSON report shows the same evidence
+    # as the terminal and HTML reports.  json.dumps still escapes control
+    # characters (for example ESC becomes \u001b) and JSON metacharacters.
+    rendered = json.dumps(top, cls=FlossJSONEncoder, sort_keys=False, ensure_ascii=False)
+    return _escape_nonprintable_json(rendered)
 
 
 def render(doc: ResultDocument) -> str:
