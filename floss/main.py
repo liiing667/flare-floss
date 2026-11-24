@@ -16,6 +16,7 @@
 import re
 import sys
 import json
+from typing import Optional
 from pathlib import Path
 
 import rich.traceback
@@ -67,9 +68,14 @@ def get_default_root() -> Path:
         return Path(__file__).resolve().parent
 
 
-def emit_json_error(message: str, code: int = 1) -> None:
+def emit_json_error(message: str, code: int = 1, stage: Optional[str] = None) -> None:
     """emit a structured JSON error on STDERR for the JSON output modes."""
-    sys.stderr.write(json.dumps({"error": message, "code": code}) + "\n")
+    error = {"error": message, "code": code}
+    if stage is not None:
+        # the analysis stage that failed, so JSON consumers can tell a partial
+        # document (emitted on STDOUT) came from an incomplete run
+        error["stage"] = stage
+    sys.stderr.write(json.dumps(error) + "\n")
 
 
 def report_error(parser, message: str) -> None:
@@ -296,16 +302,27 @@ def main(argv=None) -> int:
         cache_dir=cache_dir,
     )
 
+    pipeline_error: Optional[PipelineError] = None
     try:
         analysis_results = analyze(options)
     except PipelineError as e:
-        if args.json:
-            emit_json_error(str(e), code=e.exit_code if e.exit_code >= 0 else 1)
-        elif e.exit_code in (1, 130):
-            logger.info("%s", e)
-        else:
-            logger.error("%s", e)
-        return e.exit_code
+        partial_results = e.results
+        if partial_results is None:
+            # nothing was produced before the failure: report and bail out
+            if args.json:
+                emit_json_error(str(e), code=e.exit_code if e.exit_code >= 0 else 1)
+            elif e.exit_code in (1, 130):
+                logger.info("%s", e)
+            else:
+                logger.error("%s", e)
+            return e.exit_code
+        # a later stage failed after earlier stages completed: recover the
+        # partial results from the shared analysis transaction and render them
+        # below, so the gathered evidence is not lost; the error itself is
+        # reported after rendering
+        pipeline_error = e
+        analysis_results = partial_results
+        logger.warning("analysis incomplete: %s; rendering partial results", e)
 
     if args.json:
         r = floss.render.json.render(analysis_results)
@@ -318,6 +335,17 @@ def main(argv=None) -> int:
 
     if r:
         print(r)
+
+    if pipeline_error is not None:
+        if args.json:
+            emit_json_error(
+                str(pipeline_error),
+                code=pipeline_error.exit_code if pipeline_error.exit_code >= 0 else 1,
+                stage=pipeline_error.stage,
+            )
+        else:
+            logger.error("%s", pipeline_error)
+        return pipeline_error.exit_code
     return 0
 
 

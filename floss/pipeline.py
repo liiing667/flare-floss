@@ -16,6 +16,12 @@
 
 Unified pipeline: static/language strings, optional layout+tags,
 then vivisect deobfuscation (stack/tight/decoded) when enabled.
+
+Each run is tracked in an AnalysisTransaction: stages are accepted as they
+complete, so a later-stage failure (e.g. the vivisect workspace cannot be
+loaded after the static strings were extracted) preserves the partial results,
+the failed stage, and the cache publication state for the CLI/JSON consumers
+instead of losing them.
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ import hashlib
 from time import time
 from typing import Set, List, Optional
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import field, dataclass
 
 import halo
 import viv_utils
@@ -101,12 +107,85 @@ EXTENSIONS_SHELLCODE_32 = ("sc32", "raw32")
 EXTENSIONS_SHELLCODE_64 = ("sc64", "raw64")
 
 
-class PipelineError(Exception):
-    """Analysis failed; ``exit_code`` is for the CLI."""
+# analysis stages, in pipeline order. the transaction accepts each stage as it
+# completes; a stage that never completes is not part of the partial results.
+STAGE_STATIC_STRINGS = "static_strings"
+STAGE_LANGUAGE_STRINGS = "language_strings"
+STAGE_VIVISECT = "vivisect"
+STAGE_FIND_FEATURES = "find_features"
+STAGE_STACK_STRINGS = "stack_strings"
+STAGE_TIGHT_STRINGS = "tight_strings"
+STAGE_DECODED_STRINGS = "decoded_strings"
 
-    def __init__(self, message: str, exit_code: int = -1):
+
+@dataclass
+class AnalysisTransaction:
+    """The shared state of one analysis run.
+
+    Stage acceptance, partial results, failure recovery, and the CLI/JSON
+    consumers all go through this single transaction:
+
+    - each completed stage is recorded via accept(), so a later-stage failure
+      preserves the evidence already gathered in ``results``;
+    - on failure, fail() records the failed stage and the error, and the
+      partial ``results`` are recovered by the caller (via the PipelineError
+      carrying this transaction) instead of being lost;
+    - ``cache_published`` records whether the document was published to the
+      analysis cache; partial results are never published, so a later run
+      re-analyzes instead of being served an incomplete document.
+    """
+
+    results: ResultDocument
+    accepted_stages: List[str] = field(default_factory=list)
+    failed_stage: Optional[str] = None
+    error: Optional[str] = None
+    cache_published: bool = False
+    stage_in_progress: Optional[str] = None
+
+    @property
+    def partial(self) -> bool:
+        """whether the run stopped before all requested stages completed."""
+        return self.failed_stage is not None
+
+    def begin(self, stage: str) -> None:
+        """Mark a stage as in progress; it is the failure point until accepted."""
+        self.stage_in_progress = stage
+
+    def accept(self, stage: str) -> None:
+        """Accept a completed stage: its results are part of the document."""
+        self.accepted_stages.append(stage)
+        self.stage_in_progress = None
+
+    def fail(self, error: str, stage: Optional[str] = None) -> None:
+        """Record the failure of the given (or in-progress) stage."""
+        self.failed_stage = stage or self.stage_in_progress
+        self.error = error
+
+
+class PipelineError(Exception):
+    """Analysis failed; ``exit_code`` is for the CLI.
+
+    When the failure happened in a later stage, after earlier stages had
+    already produced results, ``transaction`` carries the shared analysis
+    transaction: the partial results, the failed stage, and the cache
+    publication state, so callers can recover the evidence instead of
+    re-running the analysis.
+    """
+
+    def __init__(self, message: str, exit_code: int = -1, transaction: Optional[AnalysisTransaction] = None):
         super().__init__(message)
         self.exit_code = exit_code
+        self.transaction = transaction
+
+    @property
+    def results(self) -> Optional[ResultDocument]:
+        """The partial results recovered from the transaction, if any."""
+        return self.transaction.results if self.transaction is not None else None
+
+    @property
+    def stage(self) -> Optional[str]:
+        """The analysis stage that failed, if known."""
+        return self.transaction.failed_stage if self.transaction is not None else None
 
 
 @dataclass
@@ -354,11 +433,168 @@ def try_layout_static(
         return None
 
 
+def _fail_transaction(txn: AnalysisTransaction, message: str, time0: float, exit_code: int = -1) -> PipelineError:
+    """Close the analysis transaction on a failed run.
+
+    Records the failure, drops the string types whose stages never completed
+    (so the partial document reflects exactly what was produced), and
+    finalizes the runtime. Partial results are never published to the analysis
+    cache: a later run must re-analyze rather than be served an incomplete
+    document. Returns the PipelineError carrying the transaction.
+    """
+    txn.fail(message)
+    results = txn.results
+    if STAGE_STACK_STRINGS not in txn.accepted_stages:
+        results.analysis.enable_stack_strings = False
+    if STAGE_TIGHT_STRINGS not in txn.accepted_stages:
+        results.analysis.enable_tight_strings = False
+    if STAGE_DECODED_STRINGS not in txn.accepted_stages:
+        results.analysis.enable_decoded_strings = False
+    results.metadata.runtime.total = get_runtime_diff(time0)
+    return PipelineError(message, exit_code=exit_code, transaction=txn)
+
+
+def _run_deobfuscation(txn: AnalysisTransaction, options: Options, sigpaths: List[Path]) -> None:
+    """Run the vivisect-based deobfuscation stages of the analysis transaction.
+
+    Stages, in order: load the vivisect workspace, identify decoding
+    functions, then extract stack, tight, and decoded strings. Each stage is
+    accepted into the transaction as it completes, so a failure in a later
+    stage preserves the results of the earlier ones. Expected failures raise
+    PipelineError; unexpected exceptions propagate. The caller closes the
+    transaction on either.
+    """
+    results = txn.results
+
+    should_save_workspace = is_save_workspace_enabled()
+    txn.begin(STAGE_VIVISECT)
+    try:
+        with halo.Halo(
+            text="analyzing program",
+            spinner="simpleDots",
+            stream=sys.stderr,
+            enabled=not options.quiet,
+        ):
+            with results.metadata.runtime.measure_and_set_time("vivisect"):
+                vw = load_vw(options.sample, options.format, sigpaths, should_save_workspace)
+    except WorkspaceLoadError as e:
+        raise PipelineError("failed to analyze sample: %s" % e, exit_code=-1)
+    results.metadata.imagebase = get_imagebase(vw)
+    txn.accept(STAGE_VIVISECT)
+
+    txn.begin(STAGE_FIND_FEATURES)
+    with results.metadata.runtime.measure_and_set_time("find_features"):
+        try:
+            selected_functions = select_functions(vw, options.analyze_functions)
+            results.analysis.functions.discovered = len(vw.getFunctions())
+        except ValueError as e:
+            # failed to find functions in workspace
+            raise PipelineError(e.args[0], exit_code=-1)
+
+        decoding_function_features, library_functions = find_decoding_function_features(
+            vw, selected_functions, disable_progress=options.quiet
+        )
+        results.analysis.functions.library = len(library_functions)
+
+    logger.trace("analysis summary:")
+    for k, v in get_vivisect_meta_info(vw, selected_functions, decoding_function_features).items():
+        logger.trace("  %s: %s", k, v or "N/A")
+    txn.accept(STAGE_FIND_FEATURES)
+
+    if results.analysis.enable_stack_strings:
+        txn.begin(STAGE_STACK_STRINGS)
+        with results.metadata.runtime.measure_and_set_time("stack_strings"):
+            funcs = selected_functions
+            if results.analysis.enable_tight_strings:
+                # don't run stack-string extraction on functions with tight loops as this will likely
+                # result in FPs and should be caught by the tightstrings extraction below
+                funcs = get_functions_without_tightloops(decoding_function_features)
+
+            results.strings.stack_strings = extract_stackstrings(
+                vw,
+                funcs,
+                options.min_length,
+                verbosity=options.verbose,
+                disable_progress=options.quiet,
+            )
+            results.analysis.functions.analyzed_stack_strings = len(funcs)
+        txn.accept(STAGE_STACK_STRINGS)
+
+    if results.analysis.enable_tight_strings:
+        txn.begin(STAGE_TIGHT_STRINGS)
+        with results.metadata.runtime.measure_and_set_time("tight_strings"):
+            tightloop_functions = get_functions_with_tightloops(decoding_function_features)
+            results.strings.tight_strings = extract_tightstrings(
+                vw,
+                tightloop_functions,
+                min_length=options.min_length,
+                verbosity=options.verbose,
+                disable_progress=options.quiet,
+            )
+            results.analysis.functions.analyzed_tight_strings = len(tightloop_functions)
+        txn.accept(STAGE_TIGHT_STRINGS)
+
+    if results.analysis.enable_decoded_strings:
+        txn.begin(STAGE_DECODED_STRINGS)
+        with results.metadata.runtime.measure_and_set_time("decoded_strings"):
+            # TODO select more based on score rather than absolute count?!
+            top_functions = get_top_functions(decoding_function_features, 20)
+
+            fvas_to_emulate = get_function_fvas(top_functions)
+            fvas_tight_functions = get_tight_function_fvas(decoding_function_features)
+            fvas_to_emulate = append_unique(fvas_to_emulate, fvas_tight_functions)
+
+            if len(fvas_to_emulate) == 0:
+                logger.info("no candidate decoding functions found.")
+            else:
+                logger.debug("identified %d candidate decoding functions", len(fvas_to_emulate))
+                for fva in fvas_to_emulate:
+                    score = decoding_function_features[fva]["score"]
+                    xrefs_to = decoding_function_features[fva]["xrefs_to"]
+                    results.analysis.functions.decoding_function_scores[fva] = {
+                        "score": score,
+                        "xrefs_to": xrefs_to,
+                    }
+                    logger.debug("  - 0x%x: score: %.3f, xrefs to: %d", fva, score, xrefs_to)
+
+            # TODO filter out strings decoded in library function or function only called by library function(s)
+            results.strings.decoded_strings = decode_strings(
+                vw,
+                fvas_to_emulate,
+                options.min_length,
+                verbosity=options.verbose,
+                disable_progress=options.quiet,
+            )
+            results.analysis.functions.analyzed_decoded_strings = len(fvas_to_emulate)
+        txn.accept(STAGE_DECODED_STRINGS)
+
+
 def analyze(options: Options) -> ResultDocument:
     """
     Run full analysis. An empty file yields a document with its hashes, the
     layout tree, and no strings; deobfuscation is recorded as disabled because
     there is no program to emulate.
+
+    Returns the result document; use analyze_transaction() to also observe the
+    shared transaction (accepted stages, cache publication state).
+    """
+    return analyze_transaction(options).results
+
+
+def analyze_transaction(options: Options) -> AnalysisTransaction:
+    """
+    Run full analysis and return the shared analysis transaction.
+
+    An empty file yields a document with its hashes, the layout tree, and no
+    strings; deobfuscation is recorded as disabled because there is no program
+    to emulate.
+
+    The run is tracked in a shared AnalysisTransaction: each stage is accepted
+    as it completes. When a later stage fails (e.g. the vivisect workspace
+    cannot be loaded after the static strings were extracted), a PipelineError
+    is raised that carries the transaction, so callers recover the partial
+    results, the failed stage, and the cache publication state instead of
+    re-running the analysis.
     """
     sample = options.sample
     analysis = copy.deepcopy(options.analysis)
@@ -367,6 +603,9 @@ def analyze(options: Options) -> ResultDocument:
         metadata=Metadata(file_path=str(sample), min_length=options.min_length),
         analysis=analysis,
     )
+    # the shared analysis transaction: stages are accepted as they complete,
+    # so a later-stage failure preserves the partial results gathered so far
+    txn = AnalysisTransaction(results=results)
 
     sample_size = sample.stat().st_size
     if sample_size > sys.maxsize:
@@ -399,7 +638,8 @@ def analyze(options: Options) -> ResultDocument:
             cached = floss.cache.load(options.cache_dir, cache_key, results.metadata.sha256, __version__)
             if cached is not None and floss.cache.covers(cached, analysis, options.min_length):
                 logger.debug("using cached results: %s", cache_key)
-                return floss.cache.materialize(cached, sample, analysis, options.min_length)
+                txn.results = floss.cache.materialize(cached, sample, analysis, options.min_length)
+                return txn
         else:
             logger.debug("FLOSS_CACHE_REFRESH set; re-analyzing and overwriting cache entry %s", cache_key)
 
@@ -487,6 +727,8 @@ def analyze(options: Options) -> ResultDocument:
             # measure_and_set_time("static_strings") already recorded above
             results.metadata.runtime.static_strings += static_runtime
 
+        txn.accept(STAGE_STATIC_STRINGS)
+
     # language-specific strings are independent of static strings: extract them
     # whenever enabled, reusing the classic extraction buffer (and layout, when
     # static+layout actually ran) for missed-string/enrichment.
@@ -528,6 +770,8 @@ def analyze(options: Options) -> ResultDocument:
                 results.strings.language_strings_missed, offset_index=layout_offset_index
             )
 
+        txn.accept(STAGE_LANGUAGE_STRINGS)
+
     if (
         results.analysis.enable_decoded_strings
         or results.analysis.enable_stack_strings
@@ -550,104 +794,24 @@ def analyze(options: Options) -> ResultDocument:
 
         sigpaths = get_signatures(options.signatures)
 
-        should_save_workspace = is_save_workspace_enabled()
         try:
-            with halo.Halo(
-                text="analyzing program",
-                spinner="simpleDots",
-                stream=sys.stderr,
-                enabled=not options.quiet,
-            ):
-                with results.metadata.runtime.measure_and_set_time("vivisect"):
-                    vw = load_vw(sample, options.format, sigpaths, should_save_workspace)
-        except WorkspaceLoadError as e:
-            raise PipelineError("failed to analyze sample: %s" % e, exit_code=-1)
-
-        results.metadata.imagebase = get_imagebase(vw)
-
-        with results.metadata.runtime.measure_and_set_time("find_features"):
-            try:
-                selected_functions = select_functions(vw, options.analyze_functions)
-                results.analysis.functions.discovered = len(vw.getFunctions())
-            except ValueError as e:
-                # failed to find functions in workspace
-                raise PipelineError(e.args[0], exit_code=-1)
-
-            decoding_function_features, library_functions = find_decoding_function_features(
-                vw, selected_functions, disable_progress=options.quiet
-            )
-            results.analysis.functions.library = len(library_functions)
-
-        logger.trace("analysis summary:")
-        for k, v in get_vivisect_meta_info(vw, selected_functions, decoding_function_features).items():
-            logger.trace("  %s: %s", k, v or "N/A")
-
-        if results.analysis.enable_stack_strings:
-            with results.metadata.runtime.measure_and_set_time("stack_strings"):
-                funcs = selected_functions
-                if results.analysis.enable_tight_strings:
-                    # don't run stack-string extraction on functions with tight loops as this will likely
-                    # result in FPs and should be caught by the tightstrings extraction below
-                    funcs = get_functions_without_tightloops(decoding_function_features)
-
-                results.strings.stack_strings = extract_stackstrings(
-                    vw,
-                    funcs,
-                    options.min_length,
-                    verbosity=options.verbose,
-                    disable_progress=options.quiet,
-                )
-                results.analysis.functions.analyzed_stack_strings = len(funcs)
-
-        if results.analysis.enable_tight_strings:
-            with results.metadata.runtime.measure_and_set_time("tight_strings"):
-                tightloop_functions = get_functions_with_tightloops(decoding_function_features)
-                results.strings.tight_strings = extract_tightstrings(
-                    vw,
-                    tightloop_functions,
-                    min_length=options.min_length,
-                    verbosity=options.verbose,
-                    disable_progress=options.quiet,
-                )
-                results.analysis.functions.analyzed_tight_strings = len(tightloop_functions)
-
-        if results.analysis.enable_decoded_strings:
-            with results.metadata.runtime.measure_and_set_time("decoded_strings"):
-                # TODO select more based on score rather than absolute count?!
-                top_functions = get_top_functions(decoding_function_features, 20)
-
-                fvas_to_emulate = get_function_fvas(top_functions)
-                fvas_tight_functions = get_tight_function_fvas(decoding_function_features)
-                fvas_to_emulate = append_unique(fvas_to_emulate, fvas_tight_functions)
-
-                if len(fvas_to_emulate) == 0:
-                    logger.info("no candidate decoding functions found.")
-                else:
-                    logger.debug("identified %d candidate decoding functions", len(fvas_to_emulate))
-                    for fva in fvas_to_emulate:
-                        score = decoding_function_features[fva]["score"]
-                        xrefs_to = decoding_function_features[fva]["xrefs_to"]
-                        results.analysis.functions.decoding_function_scores[fva] = {
-                            "score": score,
-                            "xrefs_to": xrefs_to,
-                        }
-                        logger.debug("  - 0x%x: score: %.3f, xrefs to: %d", fva, score, xrefs_to)
-
-                # TODO filter out strings decoded in library function or function only called by library function(s)
-                results.strings.decoded_strings = decode_strings(
-                    vw,
-                    fvas_to_emulate,
-                    options.min_length,
-                    verbosity=options.verbose,
-                    disable_progress=options.quiet,
-                )
-                results.analysis.functions.analyzed_decoded_strings = len(fvas_to_emulate)
+            _run_deobfuscation(txn, options, sigpaths)
+        except PipelineError as e:
+            # an expected later-stage failure (e.g. the workspace cannot be
+            # loaded): close the transaction with the partial results
+            raise _fail_transaction(txn, str(e), time0, exit_code=e.exit_code) from e
+        except Exception as e:
+            # an unexpected later-stage failure must not lose the evidence
+            # already gathered either: recover it via the transaction
+            stage = txn.stage_in_progress or "deobfuscation"
+            logger.debug("analysis stage %s failed unexpectedly", stage, exc_info=True)
+            raise _fail_transaction(txn, "analysis failed in stage %s: %s" % (stage, e), time0) from e
 
     results.metadata.runtime.total = get_runtime_diff(time0)
     logger.info("finished execution after %.2f seconds", results.metadata.runtime.total)
 
     if cache_key is not None and options.cache_dir is not None:
         logger.debug("storing results in cache: %s", cache_key)
-        floss.cache.store(options.cache_dir, cache_key, results)
+        txn.cache_published = floss.cache.store(options.cache_dir, cache_key, results)
 
-    return results
+    return txn

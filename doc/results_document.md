@@ -42,6 +42,16 @@ and `enable_decoded_strings` as `false`, as it does for .NET binaries. Earlier
 versions printed nothing. Errors, such as an unsupported file format, still exit
 non-zero and report the error on stderr.
 
+If a later analysis stage fails after earlier stages completed — for example
+the vivisect workspace cannot be loaded after the static strings were
+extracted — FLOSS recovers the partial results instead of losing them: the
+document gathered so far is rendered (in `--json` mode it is printed to
+stdout), the string types whose stages never ran are recorded as `false`, and
+the error is reported on stderr with the failed stage. The exit code is still
+non-zero, and partial results are never written to the analysis cache, so a
+later run re-analyzes the sample instead of being served an incomplete
+document.
+
 ## Top-level structure
 
 ```jsonc

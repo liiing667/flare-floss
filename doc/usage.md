@@ -207,6 +207,13 @@ stack strings. Errors, such as an unsupported file format, exit non-zero with
 the error on stderr, whether or not the file contains strings; earlier versions
 exited 0 silently for a string-less file.
 
+When a later stage fails after earlier stages completed (for example the
+vivisect workspace cannot be loaded once the static strings were extracted),
+FLOSS renders the partial results gathered so far before reporting the error,
+so the static evidence is not lost. In `--json` mode the partial document is
+printed to stdout and the structured error on stderr carries the failed
+`stage`. The exit code remains non-zero, and partial results are never cached.
+
 ### Write a standalone HTML report (`--html`)
 
 Write a self-contained HTML file that opens in a browser with the results already
