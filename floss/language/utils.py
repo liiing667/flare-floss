@@ -2,7 +2,7 @@ import re
 import array
 import struct
 import hashlib
-from typing import List, Tuple, Iterable, Optional
+from typing import Set, List, Tuple, Iterable, Optional
 from dataclasses import dataclass
 
 import pefile
@@ -73,6 +73,25 @@ def get_image_range(pe: pefile.PE) -> Tuple[VA, VA]:
     image_base = pe.OPTIONAL_HEADER.ImageBase
     image_size = pe.OPTIONAL_HEADER.SizeOfImage
     return image_base, image_base + image_size
+
+
+def get_section_name_for_offset(pe: pefile.PE, file_offset: int) -> str:
+    """return the name of the section containing the given raw file offset.
+
+    ``StaticString.offset`` is an absolute raw file offset; it must be converted
+    to an RVA before querying pefile, rather than being passed directly as an RVA.
+    """
+    try:
+        rva = pe.get_rva_from_offset(file_offset)
+    except Exception:
+        return ""
+    if rva is None:
+        return ""
+
+    section = pe.get_section_by_rva(rva)
+    if not section:
+        return ""
+    return section.Name.decode("utf-8").split("\x00")[0]
 
 
 def _scan_immediates(pattern: "re.Pattern", buf: bytes, fmt: str, base_addr: VA, rip_relative: bool) -> Iterable[VA]:
@@ -405,14 +424,21 @@ def get_extract_stats(
     all_strings = list()
     # these are ascii, extract these utf-8 to get fewer chunks (ascii may split on two-byte characters, for example)
     for ss in all_ss_strings:
-        sec = pe.get_section_by_rva(ss.offset)
-        secname = sec.Name.decode("utf-8").split("\x00")[0] if sec else ""
+        secname = get_section_name_for_offset(pe, ss.offset)
         all_strings.append((secname, ss))
 
     len_all_ss = 0
     len_lang_str = 0
 
-    lang_str_found = list()
+    # all strings are referenced by absolute raw file offsets; restrict the
+    # language strings to .rdata using the same identity as the static strings.
+    rdata_lang_strings = [
+        lang_str for lang_str in lang_strings if get_section_name_for_offset(pe, lang_str.offset) == ".rdata"
+    ]
+
+    # track object identities (StaticString is unhashable and value-equal
+    # duplicates must still be treated as distinct entries)
+    lang_str_found: Set[int] = set()
     results = list()
     for secname, s in all_strings:
         if secname != ".rdata":
@@ -427,53 +453,53 @@ def get_extract_stats(
         sha256 = hashlib.sha256()
         sha256.update(s.string.encode("utf-8"))
         s_id = sha256.hexdigest()[:3].upper()
-        s_range = (s.offset, s.offset + len(s.string))
+        s_range = get_string_span(s)
 
-        found = False
-        for lang_str in lang_strings:
-            sec = pe.get_section_by_rva(lang_str.offset)
-            lang_str_sec = sec.Name.decode("utf-8").split("\x00")[0] if sec else ""
-
-            if lang_str_sec != ".rdata":
-                continue
-
-            if (
-                lang_str.string
-                and lang_str.string in s.string
-                and lang_str_sec == secname
-                and s.offset <= lang_str.offset <= s.offset + orig_len
-            ):
-                found = True
-                len_lang_str += len(lang_str.string)
-
-                s_trimmed, replaced_len = strip_found_lang_string(s, lang_str)
-
-                type_ = "substring"
-                if s.string[: len(lang_str.string)] == lang_str.string and s.offset == lang_str.offset:
-                    type_ = "exactsubstr"
-
-                results.append((secname, s_id, s_range, True, type_, s, replaced_len, lang_str))
-
-                s = s_trimmed
-
-                lang_str_found.append(lang_str)
-
-                if replaced_len < min_len:
-                    results.append((secname, s_id, s_range, False, "missing", s, orig_len - replaced_len, lang_str))
-                    break
-
-        if not found:
+        contained = find_contained_lang_strings(s, rdata_lang_strings)
+        if not contained:
             null = StaticString(string="", offset=0, encoding=StringEncoding.UTF8)
             results.append((secname, s_id, s_range, False, "", s, 0, null))
+            continue
+
+        # account for each language string against its absolute file span
+        for lang_str in sorted(contained, key=lambda ls: ls.offset):
+            idx = lang_str.offset - s_range[0]
+            len_lang_str += len(lang_str.string)
+
+            type_ = "exactsubstr" if idx == 0 and get_string_span(lang_str) == s_range else "substring"
+
+            # remaining character count after this language string is removed
+            # from the original span (the span identity itself is byte-based)
+            remaining_len = orig_len - len(lang_str.string)
+            results.append((secname, s_id, s_range, True, type_, s, remaining_len, lang_str))
+            lang_str_found.add(id(lang_str))
+
+        # remove every contained span from the original raw bytes in one pass,
+        # keeping each surviving piece at its own absolute file offset.
+        pieces, _ = cut_contained_lang_spans(s, contained)
+        surviving = "".join(piece.string for piece in pieces)
+
+        if len(surviving) < min_len:
+            results.append(
+                (
+                    secname,
+                    s_id,
+                    s_range,
+                    False,
+                    "missing",
+                    StaticString(string=surviving, offset=s_range[0], encoding=s.encoding),
+                    orig_len - len(surviving),
+                    contained[-1],
+                )
+            )
 
     rows = list()
-    for lang_str in lang_strings:
-        sec = pe.get_section_by_rva(lang_str.offset)
-        lang_str_sec = sec.Name.decode("utf-8").split("\x00")[0] if sec else ""
+    for lang_str in rdata_lang_strings:
+        lang_str_sec = get_section_name_for_offset(pe, lang_str.offset)
         if lang_str_sec != ".rdata":
             continue
 
-        if lang_str in lang_str_found:
+        if id(lang_str) in lang_str_found:
             continue
 
         lang_str_data = lang_str.string
@@ -563,17 +589,130 @@ def get_extract_stats(
 
 def strip_found_lang_string(s: StaticString, lang_str: StaticString) -> Tuple[StaticString, int]:
     """remove the found language string from ``s``, returning the trimmed
-    ``StaticString`` and its remaining length."""
-    idx = s.string.find(lang_str.string)
-    assert idx != -1
-    if idx == 0:
-        new_offset = s.offset + idx + len(lang_str.string)
-    else:
-        new_offset = s.offset
+    ``StaticString`` and its remaining length.
 
-    replaced_s = s.string.replace(lang_str.string, "", 1)
+    the language string must reference the *same* bytes as ``s`` in the file,
+    i.e. its absolute file-offset span must be contained in the span of ``s``.
+    the bytes covered by ``lang_str`` are located via their shared file identity
+    (offsets), never via a content search, so that identical content elsewhere in
+    the file cannot be stripped or mis-attributed.
+    """
+    start, end = get_string_span(s)
+    lang_start, lang_end = get_string_span(lang_str)
+
+    if not (start <= lang_start and lang_end <= end):
+        raise ValueError("language string span is not contained in the static string span")
+
+    s_bytes = s.string.encode("utf-8")
+    lang_bytes = lang_str.string.encode("utf-8")
+
+    # relative position of the language bytes inside the static string bytes
+    idx = lang_start - start
+    length = lang_end - lang_start
+
+    if s_bytes[idx : idx + length] != lang_bytes:
+        raise ValueError("language string bytes do not match the static string bytes at the shared offset")
+
+    replaced_bytes = s_bytes[:idx] + s_bytes[idx + length :]
+    replaced_s = _decode_piece(replaced_bytes)
     replaced_len = len(replaced_s)
+
+    # keep the absolute file identity of the surviving bytes:
+    # - with a surviving prefix, the string still starts at the original offset
+    # - otherwise the string now starts immediately after the removed language span
+    new_offset = start if idx > 0 else lang_end
+
     return StaticString(string=replaced_s, offset=new_offset, encoding=s.encoding), replaced_len
+
+
+def get_string_span(s: StaticString) -> Tuple[int, int]:
+    """return the absolute, half-open file-offset span ``[start, end)`` of a string.
+
+    all static/language strings are identified by their raw file offset and the
+    UTF-8 byte length of their content, so candidates, searched ranges, extracted
+    strings and missed-string consumers share one absolute file identity.
+    """
+    start = s.offset
+    return start, start + len(s.string.encode("utf-8"))
+
+
+def is_span_contained(inner: StaticString, outer: StaticString) -> bool:
+    """return True if the absolute file-offset span of ``inner`` is fully
+    contained in the span of ``outer`` (identical spans count as contained)."""
+    inner_start, inner_end = get_string_span(inner)
+    outer_start, outer_end = get_string_span(outer)
+    return outer_start <= inner_start and inner_end <= outer_end
+
+
+def find_contained_lang_strings(s: StaticString, lang_strings: List[StaticString]) -> List[StaticString]:
+    """return all language strings whose absolute file-offset span is contained
+    in the span of static string ``s``.
+
+    matching is driven solely by the shared absolute file identity, so a language
+    string whose offset merely lands *near* (but not inside) the candidate span
+    cannot strip same-named content from a different region of the file.
+    """
+    return [lang_str for lang_str in lang_strings if lang_str.string and is_span_contained(lang_str, s)]
+
+
+def cut_contained_lang_spans(s: StaticString, lang_strings: List[StaticString]) -> Tuple[List[StaticString], bool]:
+    """remove every language-string span contained in ``s`` from its raw bytes.
+
+    the language strings are matched and removed by their absolute file-offset
+    spans against the *original* static string bytes, which keeps the identity
+    consistent even when several language strings fall inside one static string
+    or when removing an earlier span would shift later offsets.
+
+    returns the surviving ``StaticString`` pieces (each carrying its own absolute
+    file offset) and whether at least one language span was removed.
+    """
+    contained = find_contained_lang_strings(s, lang_strings)
+    if not contained:
+        return [s], False
+
+    start, end = get_string_span(s)
+    raw = s.string.encode("utf-8")
+
+    # validate that every claimed span really holds the language bytes at that
+    # absolute location, then merge the half-open spans to cut.
+    cut_spans: List[Tuple[int, int]] = []
+    for lang_str in contained:
+        lang_start, lang_end = get_string_span(lang_str)
+        idx = lang_start - start
+        length = lang_end - lang_start
+        if raw[idx : idx + length] != lang_str.string.encode("utf-8"):
+            raise ValueError("language string bytes do not match the static string bytes at the shared offset")
+        cut_spans.append((lang_start, lang_end))
+
+    cut_spans.sort()
+    merged: List[Tuple[int, int]] = []
+    for span_start, span_end in cut_spans:
+        if merged and span_start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], span_end))
+        else:
+            merged.append((span_start, span_end))
+
+    pieces: List[StaticString] = []
+    cursor = start
+    for span_start, span_end in merged:
+        if span_start > cursor:
+            piece_bytes = raw[cursor - start : span_start - start]
+            pieces.append(StaticString(string=_decode_piece(piece_bytes), offset=cursor, encoding=s.encoding))
+        cursor = span_end
+    if cursor < end:
+        piece_bytes = raw[cursor - start :]
+        pieces.append(StaticString(string=_decode_piece(piece_bytes), offset=cursor, encoding=s.encoding))
+
+    return pieces, True
+
+
+def _decode_piece(piece_bytes: bytes) -> str:
+    """decode a surviving byte piece, tolerating a boundary that splits a
+    multi-byte UTF-8 sequence on pathological input instead of aborting analysis."""
+    try:
+        return piece_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return piece_bytes.decode("utf-8", errors="replace")
 
 
 def get_missed_strings(
@@ -582,19 +721,17 @@ def get_missed_strings(
     missed_strings = list()
 
     for s in all_ss_strings:
-        orig_len = len(s.string)
-
-        found = False
-        for lang_str in lang_strings:
-            if lang_str.string and lang_str.string in s.string and s.offset <= lang_str.offset <= s.offset + orig_len:
-                found = True
-
-                s, replaced_len = strip_found_lang_string(s, lang_str)
-
-                if replaced_len < min_len:
-                    break
+        pieces, found = cut_contained_lang_spans(s, lang_strings)
 
         if not found:
             missed_strings.append(s)
+            continue
+
+        # the language string(s) only covered part of the static string's file
+        # span; keep the legitimate surviving pieces as missed evidence, each with
+        # its own absolute file offset.
+        for piece in pieces:
+            if piece.string and len(piece.string) >= min_len:
+                missed_strings.append(piece)
 
     return missed_strings
