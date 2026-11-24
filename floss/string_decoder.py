@@ -14,7 +14,6 @@
 
 
 from typing import Set, List
-from dataclasses import dataclass
 
 import tqdm
 import viv_utils
@@ -25,9 +24,11 @@ import floss.results
 import floss.strings
 import floss.logging_
 import floss.decoding_manager
+import floss.decoding_transaction
 from floss.const import (
     DS_MAX_INSN_COUNT,
     DS_FUNCTION_CALLS_RARE,
+    DS_MAX_CONTEXT_RETRIES,
     DS_FUNCTION_CALLS_OFTEN,
     DS_FUNCTION_MIN_DECODED_STRINGS,
     DS_FUNCTION_SHORTCUT_THRESHOLD_VERY_OFTEN,
@@ -35,7 +36,13 @@ from floss.const import (
 from floss.utils import is_all_zeros
 from floss.render import Verbosity
 from floss.results import AddressType, DecodedString
-from floss.decoding_manager import Delta
+from floss.decoding_manager import Delta, EmulationResult
+from floss.decoding_transaction import (
+    DeltaBytes,
+    Truncation,
+    DecodingTransaction,
+    truncate_diff,
+)
 from floss.function_argument_getter import extract_decoding_contexts
 
 logger = floss.logging_.getLogger(__name__)
@@ -172,24 +179,70 @@ def decode_strings(
                 if should_shortcut(fva, n, n_calls, len(seen)):
                     break
 
-                for delta in emulate_decoding_routine(vw, function_index, fva, ctx, max_insn_count):
-                    for delta_bytes in extract_delta_bytes(delta, ctx.decoded_at_va, fva):
+                transaction = DecodingTransaction(
+                    fva=fva,
+                    decoded_at_va=ctx.decoded_at_va,
+                    instruction_budget=max_insn_count,
+                    max_retries=DS_MAX_CONTEXT_RETRIES,
+                )
+
+                while transaction.can_retry:
+                    if transaction.budget_exhausted:
+                        transaction.rollback("shared instruction budget exhausted")
+                        break
+                    transaction.begin_attempt()
+                    result = emulate_decoding_routine(vw, function_index, fva, ctx, max_insn_count)
+                    transaction.consume_budget(min(result.instructions_executed, max_insn_count))
+
+                    delta_bytes_list = transaction.record_emulation(result, extract_delta_bytes)
+
+                    attempt_strings: List[DecodedString] = []
+                    for delta_bytes in delta_bytes_list:
                         for s in floss.utils.extract_strings(delta_bytes.bytes, min_length, seen):
+                            address = delta_bytes.address + s.offset
+                            if transaction.is_duplicate_evidence(address, s.string):
+                                # evidence already produced by an earlier attempt,
+                                # retrying must not report it a second time
+                                continue
+
                             ds = DecodedString(
-                                address=delta_bytes.address + s.offset,
+                                address=address,
                                 address_type=delta_bytes.address_type,
                                 string=s.string,
                                 encoding=s.encoding,
                                 decoded_at=delta_bytes.decoded_at,
                                 decoding_routine=delta_bytes.decoding_routine,
                             )
+                            transaction.note_evidence(address, s.string)
+                            attempt_strings.append(ds)
+
+                    status = transaction.commit()
+                    if status == floss.decoding_transaction.TransactionStatus.COMMITTED:
+                        for ds in attempt_strings:
                             floss.results.log_result(ds, verbosity)
                             seen.add(ds.string)
                             decoded_strings.append(ds)
+                        break
+
+                    logger.debug(
+                        "retrying decoding of 0x%x (call 0x%x), attempt %d/%d",
+                        fva,
+                        ctx.decoded_at_va,
+                        transaction.attempts,
+                        transaction.max_retries + 1,
+                    )
+
+                if not transaction.succeeded:
+                    logger.debug(
+                        "giving up on decoding of 0x%x (call 0x%x) after %d attempt(s)",
+                        fva,
+                        ctx.decoded_at_va,
+                        transaction.attempts,
+                    )
         return decoded_strings
 
 
-def emulate_decoding_routine(vw, function_index, function: int, context, max_instruction_count: int) -> List[Delta]:
+def emulate_decoding_routine(vw, function_index, function: int, context, max_instruction_count: int) -> EmulationResult:
     """
     Emulate a function with a given context and extract the CPU and
      memory contexts at interesting points during emulation.
@@ -209,7 +262,7 @@ def emulate_decoding_routine(vw, function_index, function: int, context, max_ins
     :param context: The initial state of the CPU and memory
       prior to the function being called.
     :param max_instruction_count: The maximum number of instructions to emulate per function.
-    :rtype: Sequence[decoding_manager.Delta]
+    :rtype: decoding_manager.EmulationResult
     """
     emu = floss.utils.make_emulator(vw)
     emu.setEmuSnap(context.emu_snap)
@@ -219,22 +272,17 @@ def emulate_decoding_routine(vw, function_index, function: int, context, max_ins
         context.decoded_at_va,
         context.return_address,
     )
-    deltas = floss.decoding_manager.emulate_function(
+    result = floss.decoding_manager.emulate_function(
         emu, function_index, function, context.return_address, max_instruction_count
     )
-    return deltas
+    return result
 
 
-@dataclass
-class DeltaBytes:
-    address: int
-    address_type: AddressType
-    bytes: bytes
-    decoded_at: int
-    decoding_routine: int
-
-
-def extract_delta_bytes(delta: Delta, decoded_at_va: int, source_fva: int = 0x0) -> List[DeltaBytes]:
+def extract_delta_bytes(
+    delta: Delta,
+    decoded_at_va: int,
+    source_fva: int = 0x0,
+) -> List[DeltaBytes]:
     """
     Extract the sequence of byte sequences that differ from before
      and after snapshots.
@@ -243,6 +291,10 @@ def extract_delta_bytes(delta: Delta, decoded_at_va: int, source_fva: int = 0x0)
     :param decoded_at_va: The virtual address of a specific call to
     the decoding function candidate that resulted in a memory diff
     :param source_fva: function VA of the decoding routine candidate
+
+    Note: truncation of over-long differences is handled by the
+     :class:`floss.decoding_transaction.DecodingTransaction` when the
+     differences are admitted, so this function returns the raw differences.
     """
     delta_bytes = []
 

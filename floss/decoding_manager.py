@@ -14,7 +14,7 @@
 
 
 from typing import List, Tuple
-from dataclasses import dataclass
+from dataclasses import field, dataclass
 
 import viv_utils
 import envi.memory
@@ -120,6 +120,26 @@ class Delta:
     post: Snapshot
 
 
+@dataclass
+class EmulationResult:
+    """
+    outcome of emulating one decoding context.
+
+    Attributes:
+        deltas: the memory deltas collected at imported API calls and at the
+         end of emulation (always relative to the initial snapshot)
+        completed: True if emulation reached the expected return address,
+         False if it was aborted, e.g. by hitting the instruction budget,
+         an invalid instruction or a memory access violation
+        instructions_executed: number of instructions executed during the
+         attempt, used to charge the shared instruction budget
+    """
+
+    deltas: List[Delta] = field(default_factory=list)
+    completed: bool = False
+    instructions_executed: int = 0
+
+
 class DeltaCollectorHook(viv_utils.emulator_drivers.Hook):
     """
     hook that collects Deltas at each imported API call.
@@ -146,9 +166,20 @@ class DeltaCollectorHook(viv_utils.emulator_drivers.Hook):
                 pass
 
 
+class InstructionCounterMonitor(viv_utils.emulator_drivers.Monitor):
+    """count the instructions executed during one emulation attempt"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.counter = 0
+
+    def prehook(self, emu, op, pc):
+        self.counter += 1
+
+
 def emulate_function(
     emu: Emulator, function_index, fva: int, return_address: int, max_instruction_count: int
-) -> List[Delta]:
+) -> EmulationResult:
     """
     Emulate a function and collect snapshots at each interesting place.
     These interesting places include calls to imported API functions
@@ -170,13 +201,16 @@ def emulate_function(
     :param max_instruction_count: The max number of instructions to emulate.
      This helps avoid unexpected infinite loops.
     """
+    result = EmulationResult()
+
     try:
         pre_snap = make_snapshot(emu)
     except MapsTooLargeError:
         logger.warning("initial snapshot mapped too much memory, can't extract strings")
-        return []
+        return result
 
     delta_collector = DeltaCollectorHook(pre_snap)
+    instruction_counter = InstructionCounterMonitor()
 
     try:
         logger.debug("Emulating function at 0x%08x", fva)
@@ -186,9 +220,12 @@ def emulate_function(
         monitor = api_hooks.ApiMonitor(function_index)
         driver.add_monitor(monitor)
         driver.add_hook(delta_collector)
+        driver.add_monitor(instruction_counter)
 
         with api_hooks.defaultHooks(driver):
             driver.run_to_va(return_address)
+            # run_to_va only returns normally when the return address is hit
+            result.completed = True
 
     except viv_utils.emulator_drivers.BreakpointHit as e:
         # TODO track/shortcut instances of this
@@ -212,12 +249,13 @@ def emulate_function(
         logger.debug("vivisect encountered an unexpected exception. will continue processing.", exc_info=True)
     logger.debug("Ended emulation at 0x%08x", emu.getProgramCounter())
 
-    deltas = delta_collector.deltas
+    result.instructions_executed = instruction_counter.counter
+    result.deltas.extend(delta_collector.deltas)
 
     try:
-        deltas.append(Delta(pre_snap, make_snapshot(emu)))
+        result.deltas.append(Delta(pre_snap, make_snapshot(emu)))
     except MapsTooLargeError:
         logger.debug("failed to create final snapshot, emulator mapped too much memory, skipping")
         pass
 
-    return deltas
+    return result

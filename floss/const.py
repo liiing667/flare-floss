@@ -27,6 +27,13 @@ MAX_STRING_LENGTH = 2048
 DS_MAX_INSN_COUNT = 20000
 # maximum number of address revisits per function when emulating decoding functions
 DS_MAX_ADDRESS_REVISITS_EMULATION = 300
+# maximum number of retries for a single decoding context before the
+# resumable transaction is rolled back and the context is skipped
+DS_MAX_CONTEXT_RETRIES = 2
+# a single memory difference may span an arbitrarily large region; only the
+# leading bytes that could realistically hold a string are kept and the rest
+# is truncated, so partial bytes are not carried across contexts or retries
+DS_MAX_DIFF_BYTES = 4096
 # shortcut decoding of a function if only few strings are found
 DS_FUNCTION_MIN_DECODED_STRINGS = 5
 # decoding candidate only called a few times
