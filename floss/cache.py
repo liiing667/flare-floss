@@ -16,8 +16,13 @@
 
 The full ResultDocument is cached on first execution and reused on later runs,
 so repeated analyses of the same sample are fast. The cache is keyed by the
-SHA-256 of the sample bytes plus the FLOSS version, and stores the same JSON
-schema emitted by ``--json``.
+SHA-256 of the sample bytes, the analysis variant (sample format, selected
+language entry point, signature set, and selected functions), and the FLOSS
+version, and stores the same JSON schema emitted by ``--json``. The variant
+identity is also embedded in the stored document (see ``CacheIdentity``), so
+different entry points on the same sample never share an entry. The default
+variant keeps the legacy key shape, so entries written by older releases keep
+hitting.
 
 Caching applies to binary sample analysis only: loading a user-supplied JSON
 document never writes to the cache.
@@ -30,11 +35,13 @@ re-analyze and overwrite its entry with ``FLOSS_CACHE_REFRESH=1``.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import tempfile
-from typing import Optional
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Tuple
 
 from platformdirs import user_cache_dir
 
@@ -59,6 +66,77 @@ ENV_CACHE_REFRESH = "FLOSS_CACHE_REFRESH"
 _DISABLED_VALUES = ("0", "false", "no", "n", "")
 # values that force a re-analysis, so FLOSS_CACHE_REFRESH=1 behaves as documented
 _ENABLED_VALUES = ("1", "true", "yes", "y")
+
+# sentinel for the FLOSS-bundled FLIRT signatures: the embedded set changes
+# only with a FLOSS release (already part of the key via the version), so a
+# custom signature directory is the only signatures-related variant input.
+# mirrors floss.cli.SIGNATURES_PATH_DEFAULT_STRING without importing the CLI.
+DEFAULT_SIGNATURES = "(embedded signatures)"
+
+
+@dataclass(frozen=True)
+class CacheIdentity:
+    """The analysis-variant identity shared by cache keys, cache entries, and reports.
+
+    The sample content (its SHA-256) and the FLOSS version are passed alongside
+    this identity, so every input that can change the extracted language, the
+    function evidence, or the string listings of a document is represented
+    exactly once:
+
+      - ``format``: how the sample bytes are interpreted (auto/pe/sc32/sc64)
+      - ``language``: the selected ``--language`` entry point (auto/go/rust/none)
+      - ``signatures``: the FLIRT signature path used to find library functions
+      - ``functions``: the sorted ``--analyze-functions`` selection, or the
+        empty tuple for a whole-sample analysis
+
+    Two runs with the same sample bytes and the same identity always produce
+    the same cache key, so alternating between variants (e.g. a Go run followed
+    by a Rust run) can never serve each other's documents.
+    """
+
+    format: str = "auto"
+    language: str = "auto"
+    signatures: str = DEFAULT_SIGNATURES
+    functions: Tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        # normalize the function selection so the same set in a different CLI
+        # order is the same variant (and the same cache key)
+        object.__setattr__(self, "functions", tuple(sorted(self.functions)))
+
+    @classmethod
+    def from_options(cls, options) -> "CacheIdentity":
+        """Build the identity of a pipeline run from its ``Options``."""
+        functions = tuple(options.analyze_functions or ())
+        signatures = str(options.signatures) if options.signatures else DEFAULT_SIGNATURES
+        return cls(
+            format=options.format,
+            language=options.language,
+            signatures=signatures,
+            functions=functions,
+        )
+
+    def is_default(self) -> bool:
+        """Whether this is the original default variant of an older FLOSS.
+
+        The default variant keeps the legacy key shape so cache entries written
+        by earlier releases keep hitting. Every other variant is namespaced in
+        its own key and never collides with a legacy/default entry.
+        """
+        return self == CacheIdentity()
+
+    def digest(self) -> str:
+        """A stable short hash of the non-default variant inputs."""
+        material = repr(
+            (
+                self.format,
+                self.language,
+                self.signatures,
+                # a tuple of ints serializes identically across runs/releases
+                list(self.functions),
+            )
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def cache_enabled() -> bool:
@@ -94,14 +172,22 @@ def get_cache_dir() -> Path:
     return Path(user_cache_dir("floss"))
 
 
-def compute_key(sha256: str, version: str, format: str = "auto") -> str:
-    """The cache key: content-addressed sample hash + analysis format + version.
+def compute_key(sha256: str, version: str, identity: Optional[CacheIdentity] = None) -> str:
+    """The cache key: content-addressed sample hash + analysis variant + version.
 
-    The analysis format is part of the key so interpreting the same sample bytes
-    under a different ``--format`` (e.g. sc32 vs sc64) never serves a stale
-    document.
+    The full analysis variant (sample format, language entry point, signature
+    set, and selected functions) is part of the key, so interpreting the same
+    sample bytes under a different variant never serves a stale document.
+
+    The default variant keeps the legacy ``{sha256}-auto-{version}`` shape so
+    entries written by older FLOSS releases remain valid cache hits; any other
+    variant gets a distinct, hash-namespaced key.
     """
-    return f"{sha256}-{format}-{version}"
+    if identity is None:
+        identity = CacheIdentity()
+    if identity.is_default():
+        return f"{sha256}-auto-{version}"
+    return f"{sha256}-variant-{identity.digest()}-{version}"
 
 
 def cache_file_path(cache_dir: Path, key: str) -> Path:
@@ -109,12 +195,20 @@ def cache_file_path(cache_dir: Path, key: str) -> Path:
     return cache_dir / f"{key}.json"
 
 
-def load(cache_dir: Path, key: str, sha256: str, version: str) -> Optional[ResultDocument]:
+def load(
+    cache_dir: Path,
+    key: str,
+    sha256: str,
+    version: str,
+    identity: Optional[CacheIdentity] = None,
+) -> Optional[ResultDocument]:
     """Load and validate a cached document, or None on a miss.
 
-    On a parse failure or a checksum or version mismatch the entry is dropped
-    so the caller re-analyzes and stores a fresh document.
+    On a parse failure or a checksum, version, or analysis-variant mismatch the
+    entry is dropped so the caller re-analyzes and stores a fresh document.
     """
+    if identity is None:
+        identity = CacheIdentity()
     path = cache_file_path(cache_dir, key)
     try:
         if not path.is_file():
@@ -136,6 +230,44 @@ def load(cache_dir: Path, key: str, sha256: str, version: str) -> Optional[Resul
         _drop_cache_entry(path)
         return None
 
+    if document_identity(doc) != identity:
+        logger.warning("dropping stale cache entry %s (analysis variant mismatch)", path.name)
+        _drop_cache_entry(path)
+        return None
+
+    return doc
+
+
+def document_identity(doc: ResultDocument) -> CacheIdentity:
+    """Read the analysis-variant identity a cached document was built with.
+
+    Documents written by older FLOSS releases predate the identity block: they
+    are treated as the default variant, which matches the only variant those
+    releases ever cached.
+    """
+    meta = doc.metadata
+    functions = tuple(sorted(meta.cache_functions))
+    return CacheIdentity(
+        format=meta.cache_format or "auto",
+        language=meta.cache_language or "auto",
+        signatures=meta.cache_signatures or DEFAULT_SIGNATURES,
+        functions=functions,
+    )
+
+
+def stamp_identity(doc: ResultDocument, identity: CacheIdentity) -> ResultDocument:
+    """Record the analysis-variant identity inside the document before storing.
+
+    The same identity drives the cache key and is embedded in the cached
+    document, so a later run can verify the entry matches its requested variant
+    instead of trusting the key alone (e.g. when reusing an old cache
+    directory). The fields are cache bookkeeping; reports keep their existing
+    language metadata and are otherwise unchanged.
+    """
+    doc.metadata.cache_format = identity.format
+    doc.metadata.cache_language = identity.language
+    doc.metadata.cache_signatures = identity.signatures
+    doc.metadata.cache_functions = list(identity.functions)
     return doc
 
 

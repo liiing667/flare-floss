@@ -70,6 +70,12 @@ non-zero and report the error on stderr.
 - `language`, `language_version`, `language_selected` — Go/Rust identification
 - `runtime` — per-stage elapsed time, e.g. `static_strings`, `layout`, `tags`
 
+Documents stored in the result cache additionally carry `cache_format`,
+`cache_language`, `cache_signatures`, and `cache_functions`: the analysis
+variant identity used to key and verify the cache entry (see
+[usage.md](usage.md)). These fields are empty on ordinary reports and on
+documents loaded from a user-supplied JSON file.
+
 `analysis` records the extraction configuration and supporting counts:
 
 - `enable_static_strings`, `enable_stack_strings`, `enable_tight_strings`,

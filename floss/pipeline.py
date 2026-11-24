@@ -387,16 +387,26 @@ def analyze(options: Options) -> ResultDocument:
     results.metadata.sha1 = hashlib.sha1(sample_buf).hexdigest()
     results.metadata.sha256 = hashlib.sha256(sample_buf).hexdigest()
 
-    # result caching: keyed on the sample bytes + FLOSS version. on a valid hit
-    # we skip extraction, layout, and tagging entirely and render from the cache.
+    # result caching: keyed on the sample bytes + the analysis variant + the
+    # FLOSS version. the variant identity (format, language, signatures, and the
+    # selected functions) is shared by the cache key, the stored document, and
+    # the report, so a different entry point on the same sample can never serve
+    # another variant's language evidence or string listings. on a valid hit we
+    # skip extraction, layout, and tagging entirely and render from the cache.
     # FLOSS_CACHE_REFRESH=1 forces a miss so the fresh result overwrites the entry.
     cache_key: Optional[str] = None
-    if options.cache_dir is not None and not options.analyze_functions and floss.cache.cache_enabled():
-        # --analyze-functions changes which functions are analyzed, so it is a miss:
-        # a hit would wrongly return a full-function document.
-        cache_key = floss.cache.compute_key(results.metadata.sha256, __version__, options.format)
+    cache_identity: Optional[floss.cache.CacheIdentity] = None
+    if options.cache_dir is not None and floss.cache.cache_enabled():
+        cache_identity = floss.cache.CacheIdentity.from_options(options)
+        cache_key = floss.cache.compute_key(results.metadata.sha256, __version__, cache_identity)
         if not floss.cache.cache_refresh():
-            cached = floss.cache.load(options.cache_dir, cache_key, results.metadata.sha256, __version__)
+            cached = floss.cache.load(
+                options.cache_dir,
+                cache_key,
+                results.metadata.sha256,
+                __version__,
+                cache_identity,
+            )
             if cached is not None and floss.cache.covers(cached, analysis, options.min_length):
                 logger.debug("using cached results: %s", cache_key)
                 return floss.cache.materialize(cached, sample, analysis, options.min_length)
@@ -646,8 +656,8 @@ def analyze(options: Options) -> ResultDocument:
     results.metadata.runtime.total = get_runtime_diff(time0)
     logger.info("finished execution after %.2f seconds", results.metadata.runtime.total)
 
-    if cache_key is not None and options.cache_dir is not None:
+    if cache_key is not None and options.cache_dir is not None and cache_identity is not None:
         logger.debug("storing results in cache: %s", cache_key)
-        floss.cache.store(options.cache_dir, cache_key, results)
+        floss.cache.store(options.cache_dir, cache_key, floss.cache.stamp_identity(results, cache_identity))
 
     return results

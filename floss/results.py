@@ -303,6 +303,14 @@ class Metadata:
     language: str = ""
     language_version: str = ""
     language_selected: str = ""  # configured by user
+    # analysis-variant identity of a cached document. empty on fresh documents
+    # and results-file loads; populated only when a document is stored in the
+    # result cache, so a later run can verify the entry matches its variant.
+    # see floss.cache.CacheIdentity.
+    cache_format: str = ""
+    cache_language: str = ""
+    cache_signatures: str = ""
+    cache_functions: List[int] = field(default_factory=list)
 
 
 @dataclass

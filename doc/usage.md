@@ -186,9 +186,18 @@ FLOSS reads the following environment variables:
 
 Result caching is **enabled by default**. The full result document is cached on
 first run and reused on later runs, so repeated analyses of the same sample are
-fast. Because a cache hit may serve a document written by an earlier run, disable
-it with `FLOSS_CACHE_ENABLE=0` (or point `FLOSS_CACHE_DIR` at a scratch
-directory) when reproducing or diffing output across code changes.
+fast. The cache key combines the sample content (its SHA-256) with the analysis
+variant — the sample `--format`, the selected `--language` entry point, the
+`--signatures` set, and any `--analyze-functions` selection — plus the FLOSS
+version. The same variant identity is embedded in the stored document, so
+analyzing one sample first as Go and then as Rust (or under a different format,
+signature set, or function selection) writes separate entries and can never
+serve another variant's language evidence or string listings. The default
+variant keeps its original key shape, so cache entries written by older FLOSS
+releases remain valid hits. Because a cache hit may still serve a document
+written by an earlier run, disable it with `FLOSS_CACHE_ENABLE=0` (or point
+`FLOSS_CACHE_DIR` at a scratch directory) when reproducing or diffing output
+across code changes.
 
 ### Write output as JSON (`-j/--json`)
 

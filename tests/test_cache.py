@@ -190,11 +190,75 @@ def test_get_cache_dir_default(monkeypatch):
 
 def test_compute_key():
     sha256 = "a" * 64
-    # auto is the default analysis format
+    # the default variant keeps the legacy key shape, so entries written by
+    # older FLOSS releases remain valid hits
     assert floss.cache.compute_key(sha256, "1.0") == f"{sha256}-auto-1.0"
-    assert floss.cache.compute_key(sha256, "1.0") == f"{sha256}-auto-1.0"
-    # the analysis format is part of the key: sc32 and sc64 never collide
-    assert floss.cache.compute_key(sha256, "1.0", "sc32") != floss.cache.compute_key(sha256, "1.0", "sc64")
+    assert floss.cache.compute_key(sha256, "1.0", floss.cache.CacheIdentity()) == f"{sha256}-auto-1.0"
+
+    # every non-default variant gets a distinct, namespaced key
+    go = floss.cache.CacheIdentity(language="go")
+    rust = floss.cache.CacheIdentity(language="rust")
+    sc32 = floss.cache.CacheIdentity(format="sc32")
+    sc64 = floss.cache.CacheIdentity(format="sc64")
+    assert floss.cache.compute_key(sha256, "1.0", go) == f"{sha256}-variant-{go.digest()}-1.0"
+    assert floss.cache.compute_key(sha256, "1.0", go) != floss.cache.compute_key(sha256, "1.0", rust)
+    assert floss.cache.compute_key(sha256, "1.0", sc32) != floss.cache.compute_key(sha256, "1.0", sc64)
+    assert floss.cache.compute_key(sha256, "1.0", go) != floss.cache.compute_key(sha256, "1.0")
+
+
+def test_cache_identity_variants_never_collide():
+    # the reported bug: alternating entry points on one sample must never share
+    # an entry. every analysis-variant input contributes to the identity hash.
+    variants = [
+        floss.cache.CacheIdentity(),
+        floss.cache.CacheIdentity(language="go"),
+        floss.cache.CacheIdentity(language="rust"),
+        floss.cache.CacheIdentity(language="none"),
+        floss.cache.CacheIdentity(format="sc32"),
+        floss.cache.CacheIdentity(signatures="/custom/sigs"),
+        floss.cache.CacheIdentity(functions=(0x401000,)),
+        floss.cache.CacheIdentity(functions=(0x401000, 0x401100)),
+    ]
+    digests = {v.digest() for v in variants}
+    assert len(digests) == len(variants)
+
+
+def test_cache_identity_functions_order_insensitive():
+    # the same function selection in a different order is the same variant
+    one = floss.cache.CacheIdentity(functions=(0x401000, 0x401100))
+    two = floss.cache.CacheIdentity(functions=(0x401100, 0x401000))
+    assert one == two
+    assert one.digest() == two.digest()
+
+
+def test_cache_identity_from_options():
+    from floss.pipeline import Options
+
+    sample = Path("sample.exe")
+    default_options = Options(
+        sample=sample,
+        min_length=4,
+        analysis=Analysis(),
+        format="auto",
+        language="auto",
+    )
+    assert floss.cache.CacheIdentity.from_options(default_options) == floss.cache.CacheIdentity()
+
+    variant_options = Options(
+        sample=sample,
+        min_length=4,
+        analysis=Analysis(),
+        format="pe",
+        language="go",
+        analyze_functions=[0x401100, 0x401000],
+        signatures=Path("/custom/sigs"),
+    )
+    identity = floss.cache.CacheIdentity.from_options(variant_options)
+    assert identity.format == "pe"
+    assert identity.language == "go"
+    assert identity.signatures == "/custom/sigs"
+    assert identity.functions == (0x401000, 0x401100)
+    assert not identity.is_default()
 
 
 def test_cache_file_path(tmp_path):
@@ -213,6 +277,96 @@ def test_store_and_load_roundtrip(tmp_path):
     assert loaded.metadata.sha256 == doc.metadata.sha256
     assert loaded.metadata.version == __version__
     assert loaded.strings.static_strings[0].string == "hello"
+
+
+def test_legacy_default_entry_loads_without_identity(tmp_path):
+    # documents written by older FLOSS releases have no cache_* identity fields:
+    # they satisfy a default-variant request just like before
+    doc = make_doc()
+    key = floss.cache.compute_key(doc.metadata.sha256, __version__)
+    floss.cache.store(tmp_path, key, doc)
+
+    loaded = floss.cache.load(
+        tmp_path,
+        key,
+        doc.metadata.sha256,
+        __version__,
+        floss.cache.CacheIdentity(),
+    )
+    assert loaded is not None
+    assert floss.cache.document_identity(loaded) == floss.cache.CacheIdentity()
+
+    # a legacy/default entry must never satisfy a non-default variant request
+    go_identity = floss.cache.CacheIdentity(language="go")
+    assert floss.cache.load(tmp_path, key, doc.metadata.sha256, __version__, go_identity) is None
+
+
+def test_stamp_identity_roundtrip(tmp_path):
+    doc = make_doc()
+    identity = floss.cache.CacheIdentity(language="go", functions=(0x401000, 0x401100))
+    key = floss.cache.compute_key(doc.metadata.sha256, __version__, identity)
+    floss.cache.store(tmp_path, key, floss.cache.stamp_identity(doc, identity))
+
+    loaded = floss.cache.load(tmp_path, key, doc.metadata.sha256, __version__, identity)
+    assert loaded is not None
+    assert floss.cache.document_identity(loaded) == identity
+    assert loaded.metadata.cache_language == "go"
+    assert loaded.metadata.cache_functions == [0x401000, 0x401100]
+
+
+def test_load_drops_variant_mismatch(tmp_path):
+    # the reported bug: a document cached for one variant must never satisfy a
+    # request for another variant, even when pointed at the same entry
+    doc = make_doc()
+    go_identity = floss.cache.CacheIdentity(language="go")
+    key = floss.cache.compute_key(doc.metadata.sha256, __version__, go_identity)
+    floss.cache.store(tmp_path, key, floss.cache.stamp_identity(doc, go_identity))
+
+    rust_identity = floss.cache.CacheIdentity(language="rust")
+    assert floss.cache.load(tmp_path, key, doc.metadata.sha256, __version__, rust_identity) is None
+    # the mismatched entry is dropped so the next run re-analyzes
+    assert not (tmp_path / f"{key}.json").exists()
+
+
+def test_variant_entries_coexist_in_one_cache_dir(tmp_path):
+    # alternating two variants on the same sample stores two separate entries,
+    # and each variant gets its own document back
+    sha256 = "a" * 64
+    go_identity = floss.cache.CacheIdentity(language="go")
+    rust_identity = floss.cache.CacheIdentity(language="rust")
+    go_key = floss.cache.compute_key(sha256, __version__, go_identity)
+    rust_key = floss.cache.compute_key(sha256, __version__, rust_identity)
+    assert go_key != rust_key
+
+    go_doc = make_doc()
+    go_doc.strings.static_strings[0].string = "go string"
+    rust_doc = make_doc()
+    rust_doc.strings.static_strings[0].string = "rust string"
+
+    floss.cache.store(tmp_path, go_key, floss.cache.stamp_identity(go_doc, go_identity))
+    floss.cache.store(tmp_path, rust_key, floss.cache.stamp_identity(rust_doc, rust_identity))
+
+    go_hit = floss.cache.load(tmp_path, go_key, sha256, __version__, go_identity)
+    rust_hit = floss.cache.load(tmp_path, rust_key, sha256, __version__, rust_identity)
+    assert go_hit is not None and rust_hit is not None
+    assert go_hit.strings.static_strings[0].string == "go string"
+    assert rust_hit.strings.static_strings[0].string == "rust string"
+
+
+def test_materialize_preserves_variant_identity(tmp_path):
+    # a cache hit serves a report that still carries the variant it was built
+    # with, so report consumers share the same identity as the cache entry
+    doc = make_doc()
+    identity = floss.cache.CacheIdentity(language="rust", format="pe")
+    key = floss.cache.compute_key(doc.metadata.sha256, __version__, identity)
+    floss.cache.store(tmp_path, key, floss.cache.stamp_identity(doc, identity))
+    loaded = floss.cache.load(tmp_path, key, doc.metadata.sha256, __version__, identity)
+    assert loaded is not None
+
+    mat = floss.cache.materialize(loaded, tmp_path / "sample.exe", wanted(), 4)
+    assert floss.cache.document_identity(mat) == identity
+    assert mat.metadata.cache_language == "rust"
+    assert mat.metadata.cache_format == "pe"
 
 
 def test_store_writes_json_schema(tmp_path):
