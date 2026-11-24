@@ -76,4 +76,7 @@ def hide_strings_by_rules(layout: ResultLayout, tag_rules: TagRules) -> ResultLa
         length=layout.length,
         strings=[s for s in layout.strings if not should_hide_string(s, tag_rules)],
         children=[hide_strings_by_rules(child, tag_rules) for child in layout.children],
+        node_id=layout.node_id,
+        generation=layout.generation,
+        domain_id=layout.domain_id,
     )

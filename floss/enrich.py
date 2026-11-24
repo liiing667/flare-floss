@@ -30,17 +30,19 @@ def layout_encoding_to_string_encoding(encoding: str) -> StringEncoding:
 
 def _walk_offset_index(
     layout: ResultLayout,
-    index: Dict[int, Tuple[ResultString, str]],
+    index: Dict[Tuple[int, int], Tuple[ResultString, str]],
 ) -> None:
     for s in layout.strings:
-        index[s.offset] = (s, layout.name)
+        # namespace offsets by buffer-domain identity so an XOR-decoded nested
+        # buffer that reuses file offsets cannot overwrite outer-buffer evidence.
+        index[(s.domain_id, s.offset)] = (s, layout.name)
     for child in layout.children:
         _walk_offset_index(child, index)
 
 
-def build_offset_index(layout: ResultLayout) -> Dict[int, Tuple[ResultString, str]]:
-    """Map file offset → (ResultString, containing layout node name)."""
-    index: Dict[int, Tuple[ResultString, str]] = {}
+def build_offset_index(layout: ResultLayout) -> Dict[Tuple[int, int], Tuple[ResultString, str]]:
+    """Map (buffer-domain id, file offset) → (ResultString, section name)."""
+    index: Dict[Tuple[int, int], Tuple[ResultString, str]] = {}
     _walk_offset_index(layout, index)
     return index
 
@@ -48,10 +50,11 @@ def build_offset_index(layout: ResultLayout) -> Dict[int, Tuple[ResultString, st
 def static_strings_from_layout(layout: ResultLayout) -> List[StaticString]:
     """Flatten a serializable layout tree into enriched StaticString values."""
     index = build_offset_index(layout)
-    # stable order by offset
+    # preserve every piece of evidence (including strings from different buffer
+    # domains that happen to share an offset), ordered by domain then offset.
     items = sorted(index.items(), key=lambda kv: kv[0])
     out: List[StaticString] = []
-    for offset, (rs, section) in items:
+    for (_domain_id, offset), (rs, section) in items:
         out.append(
             StaticString(
                 string=rs.string,
@@ -67,10 +70,11 @@ def static_strings_from_layout(layout: ResultLayout) -> List[StaticString]:
 
 def enrich_static_string(
     s: StaticString,
-    offset_index: Dict[int, Tuple[ResultString, str]],
+    offset_index: Dict[Tuple[int, int], Tuple[ResultString, str]],
+    domain_id: int,
 ) -> StaticString:
     """Copy tags/section/structure from layout for a string with a file offset."""
-    hit = offset_index.get(s.offset)
+    hit = offset_index.get((domain_id, s.offset))
     if not hit:
         return s
     rs, section = hit
@@ -88,16 +92,26 @@ def enrich_static_strings(
     strings: List[StaticString],
     layout: Optional[ResultLayout] = None,
     *,
-    offset_index: Optional[Dict[int, Tuple[ResultString, str]]] = None,
+    offset_index: Optional[Dict[Tuple[int, int], Tuple[ResultString, str]]] = None,
+    domain_id: Optional[int] = None,
 ) -> List[StaticString]:
     """
     Project layout tags/section/structure onto static strings by file offset.
 
     Pass a prebuilt ``offset_index`` when enriching multiple string lists so the
     layout tree is walked only once.
+
+    Classic/language strings are read from the raw (outer) file buffer, so they
+    are enriched against the root buffer domain (``layout.domain_id``); strings
+    inside an XOR-decoded nested buffer are only reachable through that nested
+    domain's own layout node and must not be matched by raw-buffer offsets.
     """
     if offset_index is None:
         if layout is None:
             return strings
         offset_index = build_offset_index(layout)
-    return [enrich_static_string(s, offset_index) for s in strings]
+    if domain_id is None:
+        if layout is None:
+            return strings
+        domain_id = layout.domain_id
+    return [enrich_static_string(s, offset_index, domain_id) for s in strings]

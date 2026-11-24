@@ -498,8 +498,12 @@ def analyze(options: Options) -> ResultDocument:
     ):
         # one offset index for both language_strings and language_strings_missed
         layout_offset_index = None
+        root_domain_id = None
         if layout_doc is not None:
             layout_offset_index = build_offset_index(layout_doc)
+            # language extraction reads the raw outer buffer, which is the root
+            # buffer domain; never enrich it from XOR-decoded nested domains.
+            root_domain_id = layout_doc.domain_id
 
         if results.metadata.language == Language.GO.value:
             logger.info("extracting language-specific Go strings")
@@ -522,10 +526,14 @@ def analyze(options: Options) -> ResultDocument:
         )
         if layout_offset_index is not None:
             results.strings.language_strings = enrich_static_strings(
-                results.strings.language_strings, offset_index=layout_offset_index
+                results.strings.language_strings,
+                offset_index=layout_offset_index,
+                domain_id=root_domain_id,
             )
             results.strings.language_strings_missed = enrich_static_strings(
-                results.strings.language_strings_missed, offset_index=layout_offset_index
+                results.strings.language_strings_missed,
+                offset_index=layout_offset_index,
+                domain_id=root_domain_id,
             )
 
     if (

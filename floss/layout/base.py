@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import bisect
+import itertools
 from typing import Any, Set, Dict, List, Tuple, Callable, Iterable, Optional, Sequence
 from collections import defaultdict
 
@@ -29,6 +30,10 @@ from floss.tags.engine import check_is_xor, check_is_code, check_is_reloc
 from floss.layout.types import Tag, TaggedString, ExtractedString
 
 Tagger = Callable[[ExtractedString], Sequence[Tag]]
+
+# process-wide counter that gives every Layout node a stable identity shared by
+# range acceptance, string ownership, nesting generation, and report evidence.
+_LAYOUT_ID_COUNTER = itertools.count()
 
 
 class Structure(BaseModel):
@@ -64,6 +69,16 @@ class Layout(BaseModel, abc.ABC):
 
     # human readable name
     name: str
+
+    # stable identity of this node, shared across range acceptance, string
+    # ownership, nesting generation, and the serializable report evidence.
+    # a new id is minted for every node that is constructed.
+    node_id: int = Field(default_factory=lambda: next(_LAYOUT_ID_COUNTER), init=False)
+
+    # nesting generation: 0 for a layout root, incremented for every tree level.
+    # set centrally by add_child so depth bookkeeping cannot drift between
+    # PE/ELF/Mach-O/resource construction paths.
+    generation: int = Field(default=0, init=False)
 
     parent: Optional["Layout"] = Field(default=None, init=False)
 
@@ -118,6 +133,7 @@ class Layout(BaseModel, abc.ABC):
         # maybe due to the use of the key function.
         bisect.insort(self.children, child, key=lambda c: c.slice.range.offset)  # type: ignore
         child.parent = self
+        child.generation = self.generation + 1
 
     @property
     def offset(self) -> int:
@@ -129,34 +145,149 @@ class Layout(BaseModel, abc.ABC):
         "convenience"
         return self.slice.range.end
 
+    @property
+    def depth(self) -> int:
+        "number of edges from this node to the layout root (0 for a root)"
+        return self.generation
+
+    @property
+    def buffer_domain_root(self) -> "Layout":
+        """the root of this node's buffer domain.
+
+        a buffer domain starts at the root node or at a node whose bytes live
+        in a different buffer than its parent (such as an XOR-decoded nested
+        layout). strings are extracted once per domain root.
+        """
+        node = self
+        while node.parent is not None and node.parent.slice.buf is node.slice.buf:
+            node = node.parent
+        return node
+
+    @property
+    def domain_id(self) -> int:
+        "identity of the buffer-domain root, used to namespace file offsets"
+        return self.buffer_domain_root.node_id
+
+    def _deepest(self, offset: int, end: int, buf: bytes, *, require_full: bool) -> "Layout":
+        """shared descent rule for range acceptance and string ownership.
+
+        at each level pick the most specific same-buffer sibling whose range
+        starts at or before ``offset``: the greatest start offset wins among
+        overlapping siblings, then the largest extent, then the newest node.
+        when ``require_full`` is set, a candidate must fully contain
+        ``[offset, end)``; otherwise containing just ``offset`` is enough (so a
+        string crossing a node boundary stays whole and belongs to the node
+        where it starts). descent stops when no sibling qualifies, returning
+        the current node.
+        """
+        node = self
+        while True:
+            candidates = [
+                child
+                for child in node.children
+                if child.slice.buf is buf
+                and child.offset <= offset
+                and (offset < child.end)
+                and ((not require_full) or (end <= child.end))
+            ]
+            if not candidates:
+                return node
+
+            node = max(candidates, key=lambda c: (c.offset, c.end, c.node_id))
+
+    def deepest_container(self, offset: int, end: int, buf: Optional[bytes] = None) -> "Layout":
+        """find the deepest same-buffer node whose range fully contains
+        ``[offset, end)`` (range acceptance for attaching a child).
+
+        returns this node when no descendant accepts the whole range, which is
+        how malformed/overlapping inputs that do not fit cleanly stay attached
+        to their constructing parent instead of crashing or landing in a
+        partially overlapping neighbor.
+        """
+        if buf is None:
+            buf = self.slice.buf
+
+        return self._deepest(offset, end, buf, require_full=True)
+
+    def deepest_owner(self, offset: int, buf: Optional[bytes] = None) -> "Layout":
+        """find the deepest same-buffer node whose range contains ``offset``
+        (string ownership by the string's start offset).
+
+        a string crossing a node boundary stays whole and is owned by the node
+        in which it starts; overlapping siblings resolve to the most specific
+        (greatest start offset) match.
+        """
+        if buf is None:
+            buf = self.slice.buf
+
+        return self._deepest(offset, offset + 1, buf, require_full=False)
+
+    def accept_child(self, child: "Layout") -> "Layout":
+        """attach ``child`` to the deepest node whose range fully contains it
+        and that shares its buffer.
+
+        centralizes range acceptance so that nested resources, gap/overlay
+        segments, and malformed overlapping sections all use the same layout
+        identity rule as string ownership. returns the node the child was
+        attached to.
+        """
+        if child.slice.buf is self.slice.buf:
+            container = self.deepest_container(child.offset, child.end, child.slice.buf)
+        else:
+            # a different buffer (e.g. XOR-decoded) starts its own domain; it
+            # cannot be "contained" by an offset match against another buffer,
+            # so it stays directly under the node that constructed it.
+            container = self
+        container.add_child(child)
+        return container
+
     def _distribute_strings(self, strings: Iterable[ExtractedString]) -> None:
         """
         assign each string to the deepest descendant whose range contains the
-        string's start offset. siblings are sorted and normally don't overlap;
-        if they do (malformed input), the child with the greatest start offset
-        at or before the string wins, otherwise the string stays with the parent.
-        a child over a different buffer (XOR-decoded nested layout) extracts
-        its own strings and receives nothing from here.
+        string's start offset, within the same buffer domain. siblings are
+        sorted and normally don't overlap; if they do (malformed input), the
+        child with the greatest start offset at or before the string wins.
+        a child over a different buffer (XOR-decoded nested layout) owns its
+        own buffer domain and never receives strings from this domain, and
+        strings are never dropped just because such a child overlaps them.
         """
-        if not self.children:
+        strings = list(strings)
+        if not strings:
+            return
+
+        # only same-buffer children can own strings from this domain; children
+        # in another buffer (XOR-decoded nested layouts) extract their own.
+        same_buffer_children = [c for c in self.children if c.slice.buf is self.slice.buf]
+        if not same_buffer_children:
             self.strings.extend(strings)  # type: ignore
             return
 
-        child_offsets = [c.offset for c in self.children]
-        child_strings: List[List[ExtractedString]] = [[] for _ in self.children]
+        child_offsets = [c.offset for c in same_buffer_children]
+        child_strings: Dict[int, List[ExtractedString]] = defaultdict(list)
 
         for s in strings:
             offset = s.slice.range.offset
-            i = bisect.bisect_right(child_offsets, offset) - 1
-            if i >= 0 and offset < self.children[i].end:
-                if self.children[i].slice.buf is self.slice.buf:
-                    child_strings[i].append(s)
+            # consider every same-buffer child starting at or before the
+            # string's start offset. with non-overlapping siblings only one
+            # qualifies; with overlapping siblings the greatest start offset
+            # (the most specific nested match) wins.
+            owner: Optional["Layout"] = None
+            for i in range(bisect.bisect_right(child_offsets, offset) - 1, -1, -1):
+                candidate = same_buffer_children[i]
+                if offset < candidate.end:
+                    owner = candidate
+                    break
+            if owner is not None:
+                child_strings[owner.node_id].append(s)
             else:
                 self.strings.append(s)  # type: ignore
 
-        for child, assigned in zip(self.children, child_strings):
-            if assigned:
-                child._distribute_strings(assigned)
+        # recurse with the shared node identity so deeper nesting (a resource
+        # inside a section, or overlapping descendants) resolves identically.
+        for child in same_buffer_children:
+            bucket = child_strings.pop(child.node_id, None)
+            if bucket:
+                child._distribute_strings(bucket)
 
     def extract_strings(self, min_len: int) -> None:
         """
@@ -171,7 +302,7 @@ class Layout(BaseModel, abc.ABC):
         # imported here to avoid a circular import with floss.layout.extract
         from floss.layout.extract import extract_strings as extract_slice_strings
 
-        is_buffer_domain_root = (self.parent is None) or (self.slice.buf is not self.parent.slice.buf)
+        is_buffer_domain_root = self.buffer_domain_root is self
 
         if is_buffer_domain_root:
             all_strings = extract_slice_strings(self.slice, min_len)

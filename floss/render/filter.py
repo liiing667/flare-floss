@@ -277,6 +277,9 @@ class LayoutFilter:
             length=layout.length,
             strings=strings,
             children=children,
+            node_id=layout.node_id,
+            generation=layout.generation,
+            domain_id=layout.domain_id,
         )
 
     def collect_strings(self, layout: ResultLayout) -> List[ResultString]:
@@ -306,6 +309,9 @@ class LayoutFilter:
             length=layout.length,
             strings=strings,
             children=children,
+            node_id=layout.node_id,
+            generation=layout.generation,
+            domain_id=layout.domain_id,
         )
 
     def cap_node(self, layout: ResultLayout) -> Optional[ResultLayout]:
@@ -346,6 +352,9 @@ class LayoutFilter:
                         length=child.length,
                         strings=ranked_wrapper[: self.max_strings],
                         children=arch_children,
+                        node_id=child.node_id,
+                        generation=child.generation,
+                        domain_id=child.domain_id,
                     )
                 )
             else:
@@ -364,4 +373,7 @@ class LayoutFilter:
             length=filtered.length,
             strings=strings,
             children=children,
+            node_id=filtered.node_id,
+            generation=filtered.generation,
+            domain_id=filtered.domain_id,
         )

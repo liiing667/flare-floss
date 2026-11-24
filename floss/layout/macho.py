@@ -262,14 +262,11 @@ def _add_macho_segments(parent: Layout, slice_: Slice, segments: Sequence[Dict[s
 
 
 def _attach_nested_layout(parent: Layout, child: Layout):
-    container = next(
-        (candidate for candidate in parent.children if candidate.offset <= child.offset < candidate.end),
-        None,
-    )
-    if container and child.end <= container.end:
-        container.add_child(child)
-    else:
-        parent.add_child(child)
+    # range acceptance goes through the shared layout identity: the child is
+    # attached to the deepest same-buffer node that fully contains it, or kept
+    # directly under the parent when it overflows every candidate (e.g. an
+    # overlapping/corrupt code-signature region).
+    parent.accept_child(child)
 
 
 def _parse_superblob_blobs(slice_: Slice, cs_offset: int, cs_size: int) -> Sequence[Tuple[int, int, int]]:

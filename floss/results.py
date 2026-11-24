@@ -174,6 +174,11 @@ class ResultString:
     encoding: str
     tags: List[str] = field(default_factory=list)
     structure: str = ""
+    # identity of the layout node that owns this string, and of the node's
+    # buffer-domain root. the pair (domain_id, offset) uniquely locates a
+    # string even when XOR-decoded nested buffers reuse file offsets.
+    node_id: int = -1
+    domain_id: int = -1
 
 
 @dataclass
@@ -185,6 +190,11 @@ class ResultLayout:
     length: int
     strings: List[ResultString] = field(default_factory=list)
     children: List["ResultLayout"] = field(default_factory=list)
+    # shared layout identity: stable node id, nesting generation (0 at the
+    # root), and the id of the buffer-domain root this node belongs to.
+    node_id: int = -1
+    generation: int = 0
+    domain_id: int = -1
 
     @property
     def end(self) -> int:
@@ -216,6 +226,8 @@ class ResultLayout:
                     encoding=extracted.encoding,
                     tags=tags,
                     structure=structure,
+                    node_id=layout.node_id,
+                    domain_id=layout.domain_id,
                 )
             )
 
@@ -227,6 +239,9 @@ class ResultLayout:
             length=layout.slice.range.length,
             strings=result_strings,
             children=result_children,
+            node_id=layout.node_id,
+            generation=layout.generation,
+            domain_id=layout.domain_id,
         )
 
 
@@ -458,4 +473,7 @@ def _filter_layout_string_len(layout: ResultLayout, min_length: int) -> ResultLa
         length=layout.length,
         strings=strings,
         children=children,
+        node_id=layout.node_id,
+        generation=layout.generation,
+        domain_id=layout.domain_id,
     )

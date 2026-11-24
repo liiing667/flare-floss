@@ -593,9 +593,6 @@ def compute_pe_layout(slice_: Slice, xor_key: int | None, depth: int = 0) -> Lay
 
         for resource in resources:
             # place resources into their parent section, usually .rsrc
-            container = next(
-                filter(lambda candidate: candidate.offset <= resource.offset < candidate.end, layout.children)
-            )
-            container.add_child(resource)
+            layout.accept_child(resource)
 
     return layout

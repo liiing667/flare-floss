@@ -448,7 +448,14 @@ def render(
         if layout_filter is not None and layout_filter.active:
             filtered = layout_filter.apply(layout)
             if filtered is None:
-                layout = ResultLayout(name=layout.name, offset=layout.offset, length=layout.length)
+                layout = ResultLayout(
+                    name=layout.name,
+                    offset=layout.offset,
+                    length=layout.length,
+                    node_id=layout.node_id,
+                    generation=layout.generation,
+                    domain_id=layout.domain_id,
+                )
             else:
                 layout = filtered
 
