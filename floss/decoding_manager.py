@@ -13,9 +13,11 @@
 # limitations under the License.
 
 
-from typing import List, Tuple
+import contextlib
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
+import envi.bits
 import viv_utils
 import envi.memory
 import vivisect.const
@@ -30,6 +32,9 @@ from .const import DS_MAX_ADDRESS_REVISITS_EMULATION
 
 logger = floss.logging_.getLogger(__name__)
 MAX_MAPS_SIZE = 1024 * 1024 * 100  # 100MB max memory allocated in an emulator instance
+
+# attribute under which the active EmulationGeneration is attached to an emulator
+_EMULATION_GENERATION_ATTR = "_floss_emulation_generation"
 
 
 def is_import(emu, va):
@@ -86,27 +91,201 @@ class Snapshot:
     memory: Memory
     sp: int
     pc: int
+    # the emulation generation in which this snapshot was taken;
+    # snapshots created outside of a generation (e.g. by callers that still
+    # use the legacy helpers directly) keep the default value of zero
+    generation: int = 0
 
 
-def get_map_size(emu):
-    size = 0
-    for mapva, mapsize, mperm, mfname in emu.getMemoryMaps():
-        mapsize += size
-    return mapsize
+def get_map_size(emu: Emulator) -> int:
+    """
+    Return the total size of all memory maps currently installed in the emulator.
+    """
+    return sum(mapsize for _, mapsize, _, _ in emu.getMemoryMaps())
 
 
 class MapsTooLargeError(Exception):
     pass
 
 
+class EmulationGeneration:
+    """
+    A single generation of emulator state that owns the mapped-memory budget.
+
+    Map admission, the total-size budget, snapshot publication and cleanup
+    recovery all reference the same generation, so that:
+
+      - every accepted map (no matter how small) counts against one shared
+        budget instead of only the size of the most recently added map;
+      - a map that would exceed the budget is never installed in the emulator;
+      - a snapshot is only published while the generation is still within
+        budget and matches the live emulator state;
+      - a failed publication restores the emulator to the last good state of
+        this generation instead of leaking the oversized maps into the
+        following context.
+    """
+
+    def __init__(self, emu: Emulator, max_maps_size: int = MAX_MAPS_SIZE):
+        self.emu = emu
+        self.max_maps_size = max_maps_size
+        # monotonically increasing identifier, bumped for every generation
+        self.id = getattr(emu, "_floss_emulation_generation_id", 0) + 1
+        setattr(emu, "_floss_emulation_generation_id", self.id)
+        # the authoritative, in-budget emulator memory state of this generation
+        self._baseline_memory_snap = emu.getMemorySnap()
+        self._total_maps_size = get_map_size(emu)
+        self._closed = False
+        self._original_add_memory_map = emu.addMemoryMap
+        self._had_instance_add_memory_map = "addMemoryMap" in emu.__dict__
+
+    @property
+    def total_maps_size(self) -> int:
+        return self._total_maps_size
+
+    def is_active(self) -> bool:
+        return not self._closed and get_emulation_generation(self.emu) is self
+
+    def add_memory_map(self, va: int, perms: int, fname: str, bytez: bytes, align: Optional[int] = None) -> int:
+        """
+        Admit a new memory map into this generation if it fits the budget.
+
+        Raises MapsTooLargeError (without touching the emulator state) when
+        accepting the map would exceed the total mapped-memory budget.
+        """
+        if self._closed:
+            raise MapsTooLargeError("emulation generation %d is closed" % self.id)
+
+        map_size = len(bytez)
+        if align:
+            map_size = envi.bits.align(map_size, align)
+
+        if self._total_maps_size + map_size > self.max_maps_size:
+            logger.debug(
+                "rejecting memory map of size 0x%x, emulator mapped too much memory: 0x%x",
+                map_size,
+                self._total_maps_size,
+            )
+            raise MapsTooLargeError()
+
+        map_size = self._original_add_memory_map(va, perms, fname, bytez, align)
+        self._total_maps_size += map_size
+        return map_size
+
+    def make_snapshot(self) -> Snapshot:
+        """
+        Publish a snapshot of the current CPU and memory of this generation.
+
+        If the live emulator no longer matches the generation (for example
+        because an oversized map was installed outside of the budget check),
+        the emulator is recovered to the last good state of this generation
+        and MapsTooLargeError is raised instead of publishing a stale snapshot.
+        """
+        if self._closed:
+            raise MapsTooLargeError("emulation generation %d is closed" % self.id)
+
+        current_size = get_map_size(self.emu)
+        if current_size > self.max_maps_size or current_size != self._total_maps_size:
+            logger.debug("emulator mapped too much memory: 0x%x, recovering generation %d", current_size, self.id)
+            self.recover()
+            raise MapsTooLargeError()
+
+        snapshot = Snapshot(
+            self.emu.getMemorySnap(),
+            self.emu.getStackCounter(),
+            self.emu.getProgramCounter(),
+            self.id,
+        )
+        # the freshly published snapshot becomes the new last-good state
+        self._baseline_memory_snap = snapshot.memory
+        return snapshot
+
+    def recover(self) -> None:
+        """
+        Restore the emulator memory to the last good state of this generation.
+
+        Used to clean up oversized or otherwise invalid state so that failed
+        snapshots cannot pollute subsequent emulation contexts.
+        """
+        if not self._closed:
+            self.emu.setMemorySnap(self._baseline_memory_snap)
+            self._total_maps_size = get_map_size(self.emu)
+
+    def close(self) -> None:
+        """
+        Detach the generation from the emulator and restore the unguarded
+        addMemoryMap implementation.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._had_instance_add_memory_map:
+            self.emu.addMemoryMap = self._original_add_memory_map
+        else:
+            del self.emu.addMemoryMap
+        if get_emulation_generation(self.emu) is self:
+            delattr(self.emu, _EMULATION_GENERATION_ATTR)
+
+    @contextlib.contextmanager
+    def guard_memory_maps(self):
+        """
+        Route emulator.addMemoryMap calls through this generation's budget
+        check for the duration of the context.
+        """
+        self.emu.addMemoryMap = self.add_memory_map
+        setattr(self.emu, _EMULATION_GENERATION_ATTR, self)
+        try:
+            yield self
+        finally:
+            self.close()
+
+
+def get_emulation_generation(emu: Emulator) -> Optional["EmulationGeneration"]:
+    """
+    Return the EmulationGeneration currently guarding the emulator, or None.
+    """
+    return getattr(emu, _EMULATION_GENERATION_ATTR, None)
+
+
+def add_memory_map(emu: Emulator, va: int, perms: int, fname: str, bytez: bytes, align: Optional[int] = None) -> int:
+    """
+    Add a memory map via the emulator's active generation when one exists,
+    otherwise fall back to the unguarded emulator implementation.
+    """
+    generation = get_emulation_generation(emu)
+    if generation is not None:
+        return generation.add_memory_map(va, perms, fname, bytez, align)
+    return emu.addMemoryMap(va, perms, fname, bytez, align)
+
+
 def make_snapshot(emu: Emulator) -> Snapshot:
     """
     Create a snapshot of the current CPU and memory.
+
+    When an EmulationGeneration is active, the snapshot is published through
+    that generation (including budget enforcement and cleanup recovery);
+    otherwise the legacy size check is used.
     """
+    generation = get_emulation_generation(emu)
+    if generation is not None:
+        return generation.make_snapshot()
+
     if get_map_size(emu) > MAX_MAPS_SIZE:
         logger.debug("emulator mapped too much memory: 0x%x", get_map_size(emu))
         raise MapsTooLargeError()
     return Snapshot(emu.getMemorySnap(), emu.getStackCounter(), emu.getProgramCounter())
+
+
+@contextlib.contextmanager
+def emulation_generation(emu: Emulator, max_maps_size: int = MAX_MAPS_SIZE):
+    """
+    Run a block of emulator work inside a single EmulationGeneration.
+
+    Map admission, the memory budget, snapshot publication and cleanup
+    recovery all share the same generation for the duration of the block.
+    """
+    generation = EmulationGeneration(emu, max_maps_size=max_maps_size)
+    with generation.guard_memory_maps():
+        yield generation
 
 
 @dataclass
@@ -170,54 +349,59 @@ def emulate_function(
     :param max_instruction_count: The max number of instructions to emulate.
      This helps avoid unexpected infinite loops.
     """
-    try:
-        pre_snap = make_snapshot(emu)
-    except MapsTooLargeError:
-        logger.warning("initial snapshot mapped too much memory, can't extract strings")
-        return []
+    # map admission, the size budget, snapshot publication and cleanup
+    # recovery all share one emulation generation for this function run
+    with emulation_generation(emu) as generation:
+        try:
+            pre_snap = make_snapshot(emu)
+        except MapsTooLargeError:
+            logger.warning("initial snapshot mapped too much memory, can't extract strings")
+            return []
 
-    delta_collector = DeltaCollectorHook(pre_snap)
+        delta_collector = DeltaCollectorHook(pre_snap)
 
-    try:
-        logger.debug("Emulating function at 0x%08x", fva)
-        driver = viv_utils.emulator_drivers.DebuggerEmulatorDriver(
-            emu, repmax=256, max_hit=DS_MAX_ADDRESS_REVISITS_EMULATION, max_insn=max_instruction_count
-        )
-        monitor = api_hooks.ApiMonitor(function_index)
-        driver.add_monitor(monitor)
-        driver.add_hook(delta_collector)
+        try:
+            logger.debug("Emulating function at 0x%08x", fva)
+            driver = viv_utils.emulator_drivers.DebuggerEmulatorDriver(
+                emu, repmax=256, max_hit=DS_MAX_ADDRESS_REVISITS_EMULATION, max_insn=max_instruction_count
+            )
+            monitor = api_hooks.ApiMonitor(function_index)
+            driver.add_monitor(monitor)
+            driver.add_hook(delta_collector)
 
-        with api_hooks.defaultHooks(driver):
-            driver.run_to_va(return_address)
+            with api_hooks.defaultHooks(driver):
+                driver.run_to_va(return_address)
 
-    except viv_utils.emulator_drivers.BreakpointHit as e:
-        # TODO track/shortcut instances of this
-        if e.reason == "max_insn":
-            logger.debug("Halting as emulation has escaped!")
-    except envi.InvalidInstruction as e:
-        logger.debug("vivisect encountered an invalid instruction. will continue processing. %s", e)
-    except envi.UnsupportedInstruction as e:
-        logger.debug("vivisect encountered an unsupported instruction. will continue processing. %s", e)
-    except envi.BreakpointHit as e:
-        logger.debug("vivisect encountered an unexpected emulation breakpoint. will continue processing. %s", e)
-    except envi.exc.SegmentationViolation as e:
-        tos_val = floss.utils.get_stack_value(emu, 0)
-        logger.debug("%s: top of stack (return address): 0x%x", e, tos_val)
-    except envi.exc.DivideByZero as e:
-        logger.debug("vivisect encountered an emulation error. will continue processing. %s", e)
-    except viv_utils.emulator_drivers.StopEmulation:
-        pass
-    except Exception:
-        # we cheat here a bit and skip over various errors, check this for improvements and debugging
-        logger.debug("vivisect encountered an unexpected exception. will continue processing.", exc_info=True)
-    logger.debug("Ended emulation at 0x%08x", emu.getProgramCounter())
+        except viv_utils.emulator_drivers.BreakpointHit as e:
+            # TODO track/shortcut instances of this
+            if e.reason == "max_insn":
+                logger.debug("Halting as emulation has escaped!")
+        except envi.InvalidInstruction as e:
+            logger.debug("vivisect encountered an invalid instruction. will continue processing. %s", e)
+        except envi.UnsupportedInstruction as e:
+            logger.debug("vivisect encountered an unsupported instruction. will continue processing. %s", e)
+        except envi.BreakpointHit as e:
+            logger.debug("vivisect encountered an unexpected emulation breakpoint. will continue processing. %s", e)
+        except envi.exc.SegmentationViolation as e:
+            tos_val = floss.utils.get_stack_value(emu, 0)
+            logger.debug("%s: top of stack (return address): 0x%x", e, tos_val)
+        except envi.exc.DivideByZero as e:
+            logger.debug("vivisect encountered an emulation error. will continue processing. %s", e)
+        except viv_utils.emulator_drivers.StopEmulation:
+            pass
+        except Exception:
+            # we cheat here a bit and skip over various errors, check this for improvements and debugging
+            logger.debug("vivisect encountered an unexpected exception. will continue processing.", exc_info=True)
+        logger.debug("Ended emulation at 0x%08x", emu.getProgramCounter())
 
-    deltas = delta_collector.deltas
+        deltas = delta_collector.deltas
 
-    try:
-        deltas.append(Delta(pre_snap, make_snapshot(emu)))
-    except MapsTooLargeError:
-        logger.debug("failed to create final snapshot, emulator mapped too much memory, skipping")
-        pass
+        try:
+            deltas.append(Delta(pre_snap, make_snapshot(emu)))
+        except MapsTooLargeError:
+            logger.debug("failed to create final snapshot, emulator mapped too much memory, skipping")
+            # recover the emulator to the last good state of this generation
+            # so the failed snapshot cannot pollute subsequent contexts
+            generation.recover()
 
-    return deltas
+        return deltas
